@@ -3,24 +3,19 @@ Docker Monitor Application
 Main application class for monitoring and managing Docker containers.
 """
 
-import docker
-import time
 import logging
 import tkinter as tk
 from tkinter import ttk, scrolledtext, simpledialog, messagebox
 import json
-import os
 import threading
 import queue
-import subprocess
-from datetime import datetime
 from pathlib import Path
 
 # Import custom modules
 from docker_monitor.utils.buffer_handler import log_buffer
 from docker_monitor.gui.widgets.copy_tooltip import CopyTooltip
 from docker_monitor.gui.widgets.docker_terminal import DockerTerminal
-from docker_monitor.gui.widgets.ui_components import UIComponents, MousewheelHandler
+from docker_monitor.gui.widgets.ui_components import UIComponents
 from docker_monitor.gui.managers.container_manager import ContainerManager
 from docker_monitor.gui.managers.network_manager import NetworkManager
 from docker_monitor.gui.managers.image_manager import ImageManager
@@ -33,31 +28,37 @@ from docker_monitor.utils.docker_utils import (
     docker_lock,
     stats_queue,
     manual_refresh_queue,
-    network_refresh_queue,
-    logs_stream_queue,
-    events_queue,
     CPU_LIMIT,
     RAM_LIMIT,
     CLONE_NUM,
     SLEEP_TIME,
     AUTO_SCALE_ENABLED,
-    calculate_cpu_percent,
-    calculate_ram_percent,
-    get_container_stats,
-    delete_clones,
-    docker_cleanup,
-    scale_container,
     monitor_thread,
     docker_events_listener
 )
 from docker_monitor.utils.worker import run_in_thread
+from docker_monitor.utils.observer import Observer
+from docker_monitor.utils.docker_controller import get_docker_controller
 
 
-class DockerMonitorApp(tk.Tk):
+class DockerMonitorApp(tk.Tk, Observer):
+    """
+    Main Docker Monitor Manager Application.
+    Implements Observer pattern to receive updates from DockerDataController.
+    """
+    
     def __init__(self):
         # IMPORTANT: className must EXACTLY match StartupWMClass in .desktop file
         # This is critical for window manager to show the correct icon in taskbar
         super().__init__(className="docker-monitor-manager")
+        
+        # Register with Docker Controller as an Observer
+        self.docker_controller = get_docker_controller()
+        self.docker_controller.attach(self)
+        logging.info("DockerMonitorApp registered as Observer with DockerDataController")
+        
+        # Track which tab is currently active
+        self._current_active_tab = 'containers'  # Default to containers tab
         
         # Set window title
         self.title("Docker Monitor Manager")
@@ -107,7 +108,8 @@ class DockerMonitorApp(tk.Tk):
         main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # --- Left Pane: Controls ---
-        controls_frame = ttk.Labelframe(main_pane, text="Controls", width=150)
+        controls_frame = ttk.Labelframe(main_pane, text="Controls", width=200)
+        # Don't use pack_propagate(False) - let it resize with content and sash position
         main_pane.add(controls_frame, weight=0)
 
         # --- Right Pane (Vertical Split) ---
@@ -142,7 +144,7 @@ class DockerMonitorApp(tk.Tk):
                 self.update_idletasks()
                 
                 # Left panel (controls) should be narrow
-                self._main_pane.sashpos(0, 170)
+                self._main_pane.sashpos(0, 210)
                 
                 # Top section (containers/tabs) should take about 60% of vertical space
                 # Use actual window height instead of screen height
@@ -151,7 +153,7 @@ class DockerMonitorApp(tk.Tk):
                 
                 # Bottom pane (logs/terminal) should be 50-50 horizontal split
                 # Calculate based on actual available width
-                actual_width = self.winfo_width() - 170 - 40  # subtract controls and padding
+                actual_width = self.winfo_width() - 210 - 40  # subtract controls and padding
                 self._bottom_pane.sashpos(0, actual_width // 2)
             except Exception as e:
                 logging.error(f"Error setting sash positions: {e}")
@@ -187,7 +189,6 @@ class DockerMonitorApp(tk.Tk):
 
     def _set_window_icon(self):
         """Set window icon from installed icon files or package assets."""
-        import sys
         import platform
         
         try:
@@ -260,9 +261,13 @@ class DockerMonitorApp(tk.Tk):
         except Exception as e:
             logging.error(f"Error setting window icon: {e}")
 
-    def _create_control_button(self, parent, text, bg_color, command, fg_color='white', width=15):
-        """Wrapper for UIComponents.create_control_button for backward compatibility."""
-        return UIComponents.create_control_button(parent, text, bg_color, command, fg_color, width)
+    def _create_control_button(self, parent, text, bg_color, command, fg_color='white'):
+        """Wrapper for UIComponents.create_control_button with uniform sizing.
+        
+        All buttons use the centralized minimum width (18 chars) for consistency
+        across all tabs, so buttons maintain the same size regardless of text length.
+        """
+        return UIComponents.create_control_button(parent, text, bg_color, command, fg_color)
 
     def create_control_widgets(self, parent):
         # Create a canvas with scrollbar for controls
@@ -326,8 +331,31 @@ class DockerMonitorApp(tk.Tk):
         self.selected_section_frame.pack(pady=(5, 10), padx=5, fill=tk.X)
         
         ttk.Label(self.selected_section_frame, text="Selected Item", font=('Segoe UI', 9)).pack(anchor='w')
-        self.selected_container_label = ttk.Label(self.selected_section_frame, text="None", font=('Segoe UI', 10, 'bold'), foreground=self.ACCENT_COLOR)
-        self.selected_container_label.pack(pady=5)
+        self.selected_container_label = tk.Label(
+            self.selected_section_frame, 
+            text="None", 
+            font=('Segoe UI', 10, 'bold'), 
+            foreground=self.ACCENT_COLOR,
+            bg=self.FRAME_BG,
+            wraplength=1,  # Will be updated dynamically
+            justify='left',
+            anchor='w'
+        )
+        self.selected_container_label.pack(pady=5, fill='x')
+        
+        # Update wraplength dynamically when the frame resizes
+        def update_label_wraplength(event=None):
+            try:
+                # Get the actual width of the parent frame minus padding
+                width = self.selected_section_frame.winfo_width() - 20
+                if width > 50:  # Minimum reasonable width
+                    self.selected_container_label.config(wraplength=width)
+            except Exception:
+                pass
+        
+        self.selected_section_frame.bind('<Configure>', update_label_wraplength)
+        # Initial update after a short delay
+        self.after(100, update_label_wraplength)
 
         # Container action panel (packed by default)
         self.container_actions_panel = ttk.Frame(individual_actions_frame)
@@ -350,9 +378,10 @@ class DockerMonitorApp(tk.Tk):
                 label,
                 color,
                 lambda a=action: self.run_container_action(a),
-                fg
+                fg,
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Network action panel with icons
         self.network_actions_panel = ttk.Frame(individual_actions_frame)
@@ -361,17 +390,17 @@ class DockerMonitorApp(tk.Tk):
             ('🗑️ Remove', '#b80000', 'remove'),
             ('➕ Create', '#2d6a4f', 'create'),
             ('🔗 Connect', '#1b4965', 'connect'),
-            ('❌ Disconnect', '#9a031e', 'disconnect'),
-            ('🧹 Prune', '#6c757d', 'prune')
+            ('❌ Disconnect', '#9a031e', 'disconnect')
         ]
         for label, color, action in net_actions:
             btn = self._create_control_button(
                 self.network_actions_panel,
                 label,
                 color,
-                lambda a=action: self.run_network_action(a)
+                lambda a=action: self.run_network_action(a),
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Images action panel with icons
         self.images_actions_panel = ttk.Frame(individual_actions_frame)
@@ -386,9 +415,10 @@ class DockerMonitorApp(tk.Tk):
                 self.images_actions_panel,
                 label,
                 color,
-                lambda a=action: self.run_image_action(a)
+                lambda a=action: self.run_image_action(a),
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Volumes action panel with icons
         self.volumes_actions_panel = ttk.Frame(individual_actions_frame)
@@ -403,9 +433,10 @@ class DockerMonitorApp(tk.Tk):
                 self.volumes_actions_panel,
                 label,
                 color,
-                lambda a=action: self.run_volume_action(a)
+                lambda a=action: self.run_volume_action(a),
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Dashboard action panel
         self.dashboard_actions_panel = ttk.Frame(individual_actions_frame)
@@ -429,9 +460,10 @@ class DockerMonitorApp(tk.Tk):
                 self.dashboard_actions_panel,
                 label,
                 color,
-                lambda a=action: self.run_dashboard_action(a)
+                lambda a=action: self.run_dashboard_action(a),
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Compose action panel
         self.compose_actions_panel = ttk.Frame(individual_actions_frame)
@@ -446,9 +478,10 @@ class DockerMonitorApp(tk.Tk):
                 self.compose_actions_panel,
                 label,
                 color,
-                lambda a=action: self.run_compose_action(a)
+                lambda a=action: self.run_compose_action(a),
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Info action panel
         self.info_actions_panel = ttk.Frame(individual_actions_frame)
@@ -461,9 +494,10 @@ class DockerMonitorApp(tk.Tk):
                 self.info_actions_panel,
                 label,
                 color,
-                lambda a=action: self.run_info_action(a)
+                lambda a=action: self.run_info_action(a),
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Help action panel
         self.help_actions_panel = ttk.Frame(individual_actions_frame)
@@ -485,9 +519,10 @@ class DockerMonitorApp(tk.Tk):
                 self.help_actions_panel,
                 label,
                 color,
-                lambda a=action: self.run_help_action(a)
+                lambda a=action: self.run_help_action(a),
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
 
         # Settings action panel - Advanced Operations
         self.settings_actions_panel = ttk.Frame(individual_actions_frame)
@@ -511,9 +546,108 @@ class DockerMonitorApp(tk.Tk):
                 self.settings_actions_panel,
                 label,
                 color,
-                cmd
+                cmd,
+                
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
+            btn.pack(fill=tk.X, expand=True, pady=2, padx=5)
+
+        # --- Global action panels for other tabs (hidden by default) ---
+        
+        # Images global actions panel
+        self.images_global_panel = ttk.Frame(parent)
+        ttk.Label(self.images_global_panel, text="⚡ Bulk Actions", font=('Segoe UI', 9, 'bold')).pack(pady=(0, 5), padx=10, anchor='w')
+        img_global_frame = ttk.Frame(self.images_global_panel)
+        img_global_frame.pack(pady=0, padx=10, fill=tk.X)
+        
+        img_global_actions = [
+            ('🗑️ Remove All', '#b80000', 'remove_all'),
+            ('🧹 Prune Unused', '#6c757d', 'prune')
+        ]
+        for label, color, action in img_global_actions:
+            btn = tk.Button(
+                img_global_frame,
+                text=label,
+                bg=color,
+                fg='white',
+                command=lambda a=action: self.run_image_global_action(a),
+                font=UIComponents.BUTTON_FONT,
+                cursor='hand2',
+                relief='flat',
+                width=UIComponents.BUTTON_MIN_WIDTH,
+                padx=UIComponents.BUTTON_PADX,
+                pady=UIComponents.BUTTON_PADY,
+                activebackground=color,
+                activeforeground='white',
+                bd=0,
+                highlightthickness=0
+            )
+            btn.pack(pady=2, padx=5)
+            btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=UIComponents.BUTTON_HOVER_COLOR))
+            btn.bind('<Leave>', lambda e, b=btn, c=color: b.config(bg=c))
+        
+        # Networks global actions panel
+        self.network_global_panel = ttk.Frame(parent)
+        ttk.Label(self.network_global_panel, text="⚡ Bulk Actions", font=('Segoe UI', 9, 'bold')).pack(pady=(0, 5), padx=10, anchor='w')
+        net_global_frame = ttk.Frame(self.network_global_panel)
+        net_global_frame.pack(pady=0, padx=10, fill=tk.X)
+        
+        net_global_actions = [
+            ('🗑️ Remove All (Custom)', '#b80000', 'remove_all'),
+            ('🧹 Prune Unused', '#6c757d', 'prune')
+        ]
+        for label, color, action in net_global_actions:
+            btn = tk.Button(
+                net_global_frame,
+                text=label,
+                bg=color,
+                fg='white',
+                command=lambda a=action: self.run_network_global_action(a),
+                font=UIComponents.BUTTON_FONT,
+                cursor='hand2',
+                relief='flat',
+                width=UIComponents.BUTTON_MIN_WIDTH,
+                padx=UIComponents.BUTTON_PADX,
+                pady=UIComponents.BUTTON_PADY,
+                activebackground=color,
+                activeforeground='white',
+                bd=0,
+                highlightthickness=0
+            )
+            btn.pack(pady=2, padx=5)
+            btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=UIComponents.BUTTON_HOVER_COLOR))
+            btn.bind('<Leave>', lambda e, b=btn, c=color: b.config(bg=c))
+        
+        # Volumes global actions panel
+        self.volumes_global_panel = ttk.Frame(parent)
+        ttk.Label(self.volumes_global_panel, text="⚡ Bulk Actions", font=('Segoe UI', 9, 'bold')).pack(pady=(0, 5), padx=10, anchor='w')
+        vol_global_frame = ttk.Frame(self.volumes_global_panel)
+        vol_global_frame.pack(pady=0, padx=10, fill=tk.X)
+        
+        vol_global_actions = [
+            ('🗑️ Remove All', '#b80000', 'remove_all'),
+            ('🧹 Prune Unused', '#6c757d', 'prune')
+        ]
+        for label, color, action in vol_global_actions:
+            btn = tk.Button(
+                vol_global_frame,
+                text=label,
+                bg=color,
+                fg='white',
+                command=lambda a=action: self.run_volume_global_action(a),
+                font=UIComponents.BUTTON_FONT,
+                cursor='hand2',
+                relief='flat',
+                width=UIComponents.BUTTON_MIN_WIDTH,
+                padx=UIComponents.BUTTON_PADX,
+                pady=UIComponents.BUTTON_PADY,
+                activebackground=color,
+                activeforeground='white',
+                bd=0,
+                highlightthickness=0
+            )
+            btn.pack(pady=2, padx=5)
+            btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=UIComponents.BUTTON_HOVER_COLOR))
+            btn.bind('<Leave>', lambda e, b=btn, c=color: b.config(bg=c))
 
         # --- Separator ---
         ttk.Separator(parent, orient='horizontal').pack(fill='x', pady=15, padx=10)
@@ -541,22 +675,27 @@ class DockerMonitorApp(tk.Tk):
         ]
 
         for label, color, action in global_actions:
+            fg = 'black' if color in ['#d4c100'] else 'white'
             btn = tk.Button(
                 global_actions_frame,
                 text=label,
                 bg=color,
-                fg='black' if color in ['#d4c100'] else 'white',
+                fg=fg,
                 command=lambda a=action: self.run_global_action(a),
-                font=('Segoe UI', 9, 'bold'),
+                font=UIComponents.BUTTON_FONT,
                 cursor='hand2',
                 relief='flat',
-                padx=5,
-                pady=8,
-                width=15
+                width=UIComponents.BUTTON_MIN_WIDTH,
+                padx=UIComponents.BUTTON_PADX,
+                pady=UIComponents.BUTTON_PADY,
+                activebackground=color,
+                activeforeground=fg,
+                bd=0,
+                highlightthickness=0
             )
-            btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
-            btn.bind('<Enter>', lambda e, b=btn: b.config(relief='raised'))
-            btn.bind('<Leave>', lambda e, b=btn: b.config(relief='flat'))
+            btn.pack(pady=2, padx=5)
+            btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=UIComponents.BUTTON_HOVER_COLOR))
+            btn.bind('<Leave>', lambda e, b=btn, c=color: b.config(bg=c))
 
         # --- Application Control Section (container-only) with better styling ---
         ttk.Label(self.container_footer_panel, text="🛠️ Application", font=('Segoe UI', 9, 'bold')).pack(pady=(0, 5), padx=10, anchor='w')
@@ -570,15 +709,20 @@ class DockerMonitorApp(tk.Tk):
             bg="#00ADB5", 
             fg='white', 
             command=self.force_refresh_active_tab,
-            font=('Segoe UI', 9, 'bold'),
+            font=UIComponents.BUTTON_FONT,
             cursor='hand2',
             relief='flat',
-            pady=8,
-            width=15
+            width=UIComponents.BUTTON_MIN_WIDTH,
+            padx=UIComponents.BUTTON_PADX,
+            pady=UIComponents.BUTTON_PADY,
+            activebackground="#00ADB5",
+            activeforeground='white',
+            bd=0,
+            highlightthickness=0
         )
-        refresh_btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
-        refresh_btn.bind('<Enter>', lambda e: refresh_btn.config(relief='raised'))
-        refresh_btn.bind('<Leave>', lambda e: refresh_btn.config(relief='flat'))
+        refresh_btn.pack(pady=2, padx=5)
+        refresh_btn.bind('<Enter>', lambda e: refresh_btn.config(bg=UIComponents.BUTTON_HOVER_COLOR))
+        refresh_btn.bind('<Leave>', lambda e: refresh_btn.config(bg="#00ADB5"))
 
         config_btn = tk.Button(
             app_control_frame, 
@@ -586,15 +730,20 @@ class DockerMonitorApp(tk.Tk):
             bg="#6c757d", 
             fg='white', 
             command=self.open_config_window,
-            font=('Segoe UI', 9, 'bold'),
+            font=UIComponents.BUTTON_FONT,
             cursor='hand2',
             relief='flat',
-            pady=8,
-            width=15
+            width=UIComponents.BUTTON_MIN_WIDTH,
+            padx=UIComponents.BUTTON_PADX,
+            pady=UIComponents.BUTTON_PADY,
+            activebackground="#6c757d",
+            activeforeground='white',
+            bd=0,
+            highlightthickness=0
         )
-        config_btn.pack(fill=tk.X, expand=False, pady=2, padx=5)
-        config_btn.bind('<Enter>', lambda e: config_btn.config(relief='raised'))
-        config_btn.bind('<Leave>', lambda e: config_btn.config(relief='flat'))
+        config_btn.pack(pady=2, padx=5)
+        config_btn.bind('<Enter>', lambda e: config_btn.config(bg=UIComponents.BUTTON_HOVER_COLOR))
+        config_btn.bind('<Leave>', lambda e: config_btn.config(bg="#6c757d"))
 
 
     def create_container_widgets(self, parent):
@@ -1629,15 +1778,22 @@ class DockerMonitorApp(tk.Tk):
 
 
     def update_dashboard(self):
-        """Update dashboard statistics."""
-        dash_vars = {
-            'running': self.dash_containers_running,
-            'stopped': self.dash_containers_stopped,
-            'images': self.dash_images_count,
-            'volumes': self.dash_volumes_count,
-            'networks': self.dash_networks_count
-        }
-        SystemManager.update_dashboard(dash_vars)
+        """Update dashboard statistics.
+        
+        Only updates when Dashboard tab is active to save resources.
+        """
+        # Only update if dashboard tab is currently active
+        if self._current_active_tab == 'dashboard':
+            dash_vars = {
+                'running': self.dash_containers_running,
+                'stopped': self.dash_containers_stopped,
+                'images': self.dash_images_count,
+                'volumes': self.dash_volumes_count,
+                'networks': self.dash_networks_count
+            }
+            SystemManager.update_dashboard(dash_vars)
+        
+        # Schedule next update (only runs when dashboard is active)
         self.after(5000, self.update_dashboard)
 
     def refresh_dashboard(self):
@@ -1916,7 +2072,13 @@ class DockerMonitorApp(tk.Tk):
         )
 
     def update_volumes_list(self):
-        """Update volumes list periodically."""
+        """Update volumes list periodically - only when volumes tab is active."""
+        # Only update if volumes tab is currently active
+        if self._current_active_tab != 'volumes':
+            # Skip update but re-schedule
+            self.after(5000, self.update_volumes_list)
+            return
+        
         # Use shared thread pool for fetches
         def _fetch():
             return VolumeManager.fetch_volumes()
@@ -1964,7 +2126,13 @@ class DockerMonitorApp(tk.Tk):
         )
 
     def update_images_list(self):
-        """Update images list periodically."""
+        """Update images list periodically - only when images tab is active."""
+        # Only update if images tab is currently active
+        if self._current_active_tab != 'images':
+            # Skip update but re-schedule
+            self.after(5000, self.update_images_list)
+            return
+        
         # Use shared thread pool for fetches
         def _fetch():
             return ImageManager.fetch_images()
@@ -2015,10 +2183,80 @@ class DockerMonitorApp(tk.Tk):
                 self.update_images_list()
         elif action == 'inspect':
             ImageManager.show_image_inspect_modal(self, iid)
+        elif action == 'tag':
+            tag_callback = lambda: simpledialog.askstring('Tag Image', 'Enter new repository:tag')
+            ImageManager.tag_image(iid, tag_callback, self.update_images_list)
 
     def pull_image(self, repo):
         """Wrapper for backward compatibility."""
         ImageManager.pull_image(repo, self.update_images_list)
+    
+    def run_image_global_action(self, action):
+        """Handle image bulk actions."""
+        if action == 'prune':
+            confirm = lambda: messagebox.askyesno('Confirm Prune', 'Remove all unused images?\nThis cannot be undone!')
+            ImageManager.prune_images(confirm, lambda msg: self.status_bar.config(text=msg))
+            self.update_images_list()
+        elif action == 'remove_all':
+            confirm = lambda: messagebox.askyesno('⚠️ Confirm Remove All', 
+                                                  'Remove ALL images?\n\n'
+                                                  'This will delete every image on your system!\n'
+                                                  'This action cannot be undone.\n\n'
+                                                  'Continue?')
+            ImageManager.remove_all_images(confirm, lambda msg: self.status_bar.config(text=msg), self.update_images_list)
+    
+    def run_network_global_action(self, action):
+        """Handle network bulk actions."""
+        if action == 'prune':
+            self.prune_networks()
+        elif action == 'remove_all':
+            messagebox.showinfo('Info', 'This will only remove custom networks.\nDefault networks (bridge, host, none) cannot be removed.')
+            if messagebox.askyesno('⚠️ Confirm', 'Remove all custom networks?\nThis may disconnect containers!'):
+                def remove():
+                    try:
+                        with docker_lock:
+                            networks = client.networks.list()
+                        defaults = ['bridge', 'host', 'none']
+                        custom = [n for n in networks if n.name not in defaults]
+                        count = 0
+                        for net in custom:
+                            try:
+                                net.remove()
+                                count += 1
+                            except Exception as e:
+                                logging.debug(f"Could not remove network {net.name}: {e}")
+                        self.status_bar.config(text=f"✅ Removed {count} custom networks")
+                        self.update_network_list()
+                    except Exception as e:
+                        logging.error(f"Error removing networks: {e}")
+                run_in_thread(remove, on_done=None, on_error=lambda e: logging.error(f"Remove failed: {e}"), tk_root=self)
+    
+    def run_volume_global_action(self, action):
+        """Handle volume bulk actions."""
+        if action == 'prune':
+            VolumeManager.prune_volumes(self.update_volumes_list, self.status_bar)
+        elif action == 'remove_all':
+            if messagebox.askyesno('⚠️ Confirm Remove All', 
+                                   'Remove ALL volumes?\n\n'
+                                   'This will delete all volume data!\n'
+                                   'This action cannot be undone.\n\n'
+                                   'Continue?'):
+                def remove():
+                    try:
+                        with docker_lock:
+                            volumes = client.volumes.list()
+                        count = 0
+                        for vol in volumes:
+                            try:
+                                vol.remove()
+                                count += 1
+                            except Exception as e:
+                                logging.debug(f"Could not remove volume {vol.name}: {e}")
+                        self.status_bar.config(text=f"✅ Removed {count} volumes")
+                        self.update_volumes_list()
+                    except Exception as e:
+                        logging.error(f"Error removing volumes: {e}")
+                run_in_thread(remove, on_done=None, on_error=lambda e: logging.error(f"Remove failed: {e}"), tk_root=self)
 
     def run_dashboard_action(self, action):
         """Handle dashboard tab actions."""
@@ -2092,7 +2330,7 @@ class DockerMonitorApp(tk.Tk):
                         self.help_canvas.update_idletasks()
                         
                         # Get the canvas window
-                        canvas_window = self.help_canvas.find_withtag("all")[0]
+                        _ = self.help_canvas.find_withtag("all")[0]
                         
                         # Get widget's position relative to its parent
                         widget_y = widget.winfo_y()
@@ -2129,6 +2367,20 @@ class DockerMonitorApp(tk.Tk):
         except Exception:
             return
 
+        # Track current active tab
+        if '📦 Containers' in tab_text:
+            self._current_active_tab = 'containers'
+        elif '🌐 Network' in tab_text:
+            self._current_active_tab = 'networks'
+        elif '🖼️ Images' in tab_text:
+            self._current_active_tab = 'images'
+        elif '💾 Volumes' in tab_text:
+            self._current_active_tab = 'volumes'
+        elif '📊 Dashboard' in tab_text:
+            self._current_active_tab = 'dashboard'
+        else:
+            self._current_active_tab = 'other'
+
         # default: hide all action panels
         try:
             self.container_actions_panel.pack_forget()
@@ -2140,6 +2392,11 @@ class DockerMonitorApp(tk.Tk):
             self.info_actions_panel.pack_forget()
             self.help_actions_panel.pack_forget()
             self.settings_actions_panel.pack_forget()
+            # Hide global action panels
+            self.images_global_panel.pack_forget()
+            self.network_global_panel.pack_forget()
+            self.volumes_global_panel.pack_forget()
+            self.container_footer_panel.pack_forget()
         except Exception:
             pass
 
@@ -2163,43 +2420,39 @@ class DockerMonitorApp(tk.Tk):
                 self.container_footer_panel.pack(pady=0, padx=0, fill=tk.X)
             except Exception:
                 pass
+            # Force refresh container data when entering tab
+            self._refresh_active_tab_data('containers')
+            
         elif '🌐 Network' in tab_text:
             self.network_actions_panel.pack(fill=tk.BOTH, expand=True)
-            # hide container footer when viewing networks
-            try:
-                self.container_footer_panel.pack_forget()
-            except Exception:
-                pass
+            # Show network global actions
+            self.network_global_panel.pack(pady=0, padx=0, fill=tk.X)
+            # Force refresh network data when entering tab
+            self._refresh_active_tab_data('networks')
+            
         elif '🖼️ Images' in tab_text:
             self.images_actions_panel.pack(fill=tk.BOTH, expand=True)
-            try:
-                self.container_footer_panel.pack_forget()
-            except Exception:
-                pass
+            # Show images global actions
+            self.images_global_panel.pack(pady=0, padx=0, fill=tk.X)
+            # Force refresh image data when entering tab
+            self._refresh_active_tab_data('images')
+            
         elif '💾 Volumes' in tab_text:
             self.volumes_actions_panel.pack(fill=tk.BOTH, expand=True)
-            try:
-                self.container_footer_panel.pack_forget()
-            except Exception:
-                pass
+            # Show volumes global actions
+            self.volumes_global_panel.pack(pady=0, padx=0, fill=tk.X)
+            # Force refresh volume data when entering tab
+            self._refresh_active_tab_data('volumes')
+            
         elif '📊 Dashboard' in tab_text:
             self.dashboard_actions_panel.pack(fill=tk.BOTH, expand=True)
-            try:
-                self.container_footer_panel.pack_forget()
-            except Exception:
-                pass
+            # Refresh dashboard data when entering tab
+            self._refresh_active_tab_data('dashboard')
+            
         elif '🐳 Compose' in tab_text:
             self.compose_actions_panel.pack(fill=tk.BOTH, expand=True)
-            try:
-                self.container_footer_panel.pack_forget()
-            except Exception:
-                pass
         elif '💡 Info' in tab_text:
             self.info_actions_panel.pack(fill=tk.BOTH, expand=True)
-            try:
-                self.container_footer_panel.pack_forget()
-            except Exception:
-                pass
         elif '📚 Help' in tab_text:
             self.help_actions_panel.pack(fill=tk.BOTH, expand=True)
             try:
@@ -2222,9 +2475,54 @@ class DockerMonitorApp(tk.Tk):
             self.network_tree, net_list, self.network_tree_tags_configured, 
             self.BG_COLOR, self.FRAME_BG
         )
+    
+    def _refresh_active_tab_data(self, tab_name):
+        """Force refresh data for a specific tab when it becomes active."""
+        if tab_name == 'networks':
+            # Immediately fetch network data
+            def _fetch():
+                try:
+                    net_list = NetworkManager.fetch_networks()
+                    self.after(0, lambda: self._apply_network_list(net_list))
+                except Exception as e:
+                    logging.error(f"Error fetching networks: {e}")
+            from docker_monitor.utils.worker import run_in_thread
+            run_in_thread(_fetch, on_done=None, on_error=lambda e: logging.error(f"Network fetch failed: {e}"), tk_root=None, block=False)
+        
+        elif tab_name == 'images':
+            # Immediately fetch image data
+            def _fetch():
+                try:
+                    img_list = ImageManager.fetch_images()
+                    self.after(0, lambda: self._on_images_fetched(img_list))
+                except Exception as e:
+                    logging.error(f"Error fetching images: {e}")
+            from docker_monitor.utils.worker import run_in_thread
+            run_in_thread(_fetch, on_done=None, on_error=lambda e: logging.error(f"Image fetch failed: {e}"), tk_root=None, block=False)
+        
+        elif tab_name == 'volumes':
+            # Immediately fetch volume data
+            def _fetch():
+                try:
+                    vol_list = VolumeManager.fetch_volumes()
+                    self.after(0, lambda: self._on_volumes_fetched(vol_list))
+                except Exception as e:
+                    logging.error(f"Error fetching volumes: {e}")
+            from docker_monitor.utils.worker import run_in_thread
+            run_in_thread(_fetch, on_done=None, on_error=lambda e: logging.error(f"Volume fetch failed: {e}"), tk_root=None, block=False)
+        
+        elif tab_name == 'dashboard':
+            # Refresh dashboard
+            self.refresh_dashboard()
 
     def update_network_list(self):
-        """Update network list periodically."""
+        """Update network list periodically - only when network tab is active."""
+        # Only update if network tab is currently active
+        if self._current_active_tab != 'networks':
+            # Skip update but re-schedule
+            self.after(5000, self.update_network_list)
+            return
+        
         # Fetch networks in background to avoid blocking Tk main loop
         def _worker():
             try:
@@ -2283,24 +2581,27 @@ class DockerMonitorApp(tk.Tk):
         item = self.network_tree.item(selected_items[0])
         network_name = item['values'][1]
         logging.info(f"User requested '{action}' on network '{network_name}'.")
-        with docker_lock:
-            try:
+        if action == 'remove':
+            confirm_callback = lambda prompt: messagebox.askyesno("Confirm Remove", prompt)
+            NetworkManager.remove_network(network_name, confirm_callback, tk_root=self)
+            return
+
+        try:
+            with docker_lock:
                 net = client.networks.get(network_name)
-                if action == 'remove':
-                    confirm = messagebox.askyesno("Confirm Remove", f"Remove network '{network_name}'? This may disconnect containers.")
-                    if confirm:
-                        net.remove()
-                        logging.info(f"Removed network {network_name}.")
-                        # refresh network list immediately
-                        self.update_network_list()
-                elif action == 'inspect':
-                    self._show_network_inspect_modal(net)
-                elif action == 'connect':
-                    self.connect_container_to_network(net)
-                elif action == 'disconnect':
-                    self.disconnect_container_from_network(net)
-            except Exception as e:
-                logging.error(f"Error during '{action}' on network '{network_name}': {e}")
+        except Exception as e:
+            logging.error(f"Error fetching network '{network_name}' for action '{action}': {e}")
+            return
+
+        try:
+            if action == 'inspect':
+                self._show_network_inspect_modal(net)
+            elif action == 'connect':
+                self.connect_container_to_network(net)
+            elif action == 'disconnect':
+                self.disconnect_container_from_network(net)
+        except Exception as e:
+            logging.error(f"Error during '{action}' on network '{network_name}': {e}")
 
     def _show_network_inspect_modal(self, net):
         try:
@@ -2341,8 +2642,8 @@ class DockerMonitorApp(tk.Tk):
         name_callback = lambda: simpledialog.askstring("Create Network", "Enter network name:")
         driver_callback = lambda: simpledialog.askstring("Create Network", "Driver (bridge/overlay/etc):", initialvalue='bridge')
         success_callback = lambda: self.update_network_list()
-        
-        NetworkManager.create_network(name_callback, driver_callback, success_callback)
+
+        NetworkManager.create_network(name_callback, driver_callback, success_callback, tk_root=self)
 
     def connect_container_to_network(self, net):
         """Show a dialog with list of all containers to connect to the network."""
@@ -2820,8 +3121,9 @@ class DockerMonitorApp(tk.Tk):
         except Exception:
             pass
 
-        # Schedule a single update after 200ms to batch quick successive events
-        self._container_update_after_id = self.after(200, lambda: self._apply_containers_to_tree(self._all_containers))
+        # Schedule a single update after 100ms to batch quick successive events
+        # Reduced from 200ms to make UI feel more responsive
+        self._container_update_after_id = self.after(100, lambda: self._apply_containers_to_tree(self._all_containers))
     
     def _apply_containers_to_tree(self, stats_list):
         """Apply container list to tree view."""
@@ -2866,8 +3168,124 @@ class DockerMonitorApp(tk.Tk):
             self.volumes_search_var, self.BG_COLOR, self.FRAME_BG
         )
 
+    # === Observer Pattern Implementation ===
+    
+    def update(self, subject, data: dict) -> None:
+        """
+        Observer pattern update method.
+        Called by DockerDataController when data changes.
+        
+        Args:
+            subject: The DockerDataController instance
+            data: Dictionary containing event_type and data payload
+        """
+        if data is None:
+            logging.warning("Observer update called with None data")
+            return
+        
+        event_type = data.get('event_type')
+        payload = data.get('data')
+        
+        if event_type is None:
+            logging.warning("Observer update called without event_type")
+            return
+        
+        try:
+            if event_type == 'containers_updated':
+                # Update container tree view
+                if payload is not None:
+                    self.after(0, lambda: self._update_tree_from_stats(payload))
+                    logging.debug(f"UI updated with {len(payload)} containers")
+                
+            elif event_type == 'networks_updated':
+                # Update network tree view
+                if payload is not None:
+                    self.after(0, lambda: self._apply_network_list(payload))
+                    logging.debug(f"UI updated with {len(payload)} networks")
+                
+            elif event_type == 'images_updated':
+                # Update images tree view
+                if payload is not None:
+                    self.after(0, lambda: self._on_images_fetched(payload))
+                    logging.debug(f"UI updated with {len(payload)} images")
+                
+            elif event_type == 'volumes_updated':
+                # Update volumes tree view
+                if payload is not None:
+                    self.after(0, lambda: self._on_volumes_fetched(payload))
+                    logging.debug(f"UI updated with {len(payload)} volumes")
+                
+            elif event_type == 'docker_event':
+                # Handle real-time Docker events
+                if payload is not None:
+                    action = payload.get('Action', '')
+                    actor_type = payload.get('Type', '')
+                    logging.debug(f"Docker event: {action} on {actor_type}")
+                
+            elif event_type == 'container_action':
+                # Handle container action completion
+                if payload is not None:
+                    action = payload.get('action')
+                    container_name = payload.get('container_name')
+                    success = payload.get('success')
+                    if success:
+                        logging.info(f"✓ Container action '{action}' on '{container_name}' completed")
+                    else:
+                        error = payload.get('error')
+                        logging.error(f"✗ Container action '{action}' on '{container_name}' failed: {error}")
+                
+            elif event_type == 'network_action':
+                # Handle network action completion
+                if payload is not None:
+                    action = payload.get('action')
+                    network_name = payload.get('network_name')
+                    success = payload.get('success')
+                    if success:
+                        logging.info(f"✓ Network action '{action}' on '{network_name}' completed")
+                    
+            elif event_type == 'image_action':
+                # Handle image action completion
+                if payload is not None:
+                    action = payload.get('action')
+                    image_id = payload.get('image_id')
+                    success = payload.get('success')
+                    if success:
+                        logging.info(f"✓ Image action '{action}' on '{image_id}' completed")
+                    
+            elif event_type == 'volume_action':
+                # Handle volume action completion
+                if payload is not None:
+                    action = payload.get('action')
+                    volume_name = payload.get('volume_name')
+                    success = payload.get('success')
+                    if success:
+                        logging.info(f"✓ Volume action '{action}' on '{volume_name}' completed")
+            
+            else:
+                logging.debug(f"Unknown event_type: {event_type}")
+                    
+        except (tk.TclError, RuntimeError) as e:
+            # Tkinter widget destroyed or not ready
+            logging.warning(f"UI update failed for {event_type}: {e}")
+        except Exception as e:
+            logging.error(f"Error handling Observer update for {event_type}: {e}", exc_info=True)
+    
+    # === End Observer Pattern Implementation ===
+
     def update_container_list(self):
-        """Checks the queue for new stats and updates the Treeview."""
+        """
+        Checks the queue for new stats and updates the Treeview.
+        
+        NOTE: Container monitoring runs CONTINUOUSLY regardless of active tab,
+        because containers need to be monitored and managed all the time for:
+        - Resource consumption tracking (CPU/RAM)
+        - Auto-scaling decisions
+        - Real-time status updates
+        - Event-driven notifications
+        
+        This method now runs less frequently (every 2 seconds) since the Observer
+        pattern provides immediate updates for Docker events.
+        """
         try:
             # First, check for manual refresh data, which has priority
             while not manual_refresh_queue.empty():
@@ -2877,17 +3295,26 @@ class DockerMonitorApp(tk.Tk):
                 while not stats_queue.empty():
                     stats_queue.get_nowait()
 
+            # Process all available stats updates (batch processing)
+            stats_count = 0
+            latest_stats = None
             while not stats_queue.empty():
-                stats_list = stats_queue.get_nowait()
+                latest_stats = stats_queue.get_nowait()
+                stats_count += 1
 
-                # Use the helper to update the tree from the queued stats
-                self._update_tree_from_stats(stats_list)
+            # Only update UI with the latest stats (skip intermediate updates)
+            if latest_stats is not None:
+                self._update_tree_from_stats(latest_stats)
+                if stats_count > 1:
+                    logging.debug(f"Batched {stats_count} container updates")
 
         except queue.Empty:
             pass
+        except Exception as e:
+            logging.error(f"Error updating container list: {e}")
         finally:
-            # Schedule the next check
-            self.after(1000, self.update_container_list)
+            # Schedule the next check (reduced frequency from 1s to 2s)
+            self.after(2000, self.update_container_list)
 
     def _reapply_row_tags(self):
         """Wrapper for ContainerManager.reapply_row_tags."""
@@ -2895,40 +3322,57 @@ class DockerMonitorApp(tk.Tk):
 
     def update_logs(self):
         """Periodically checks the log buffer and appends new entries."""
-        if len(log_buffer) > self.log_update_idx:
-            self.log_text.config(state='normal')
-            for i in range(self.log_update_idx, len(log_buffer)):
-                self.log_text.insert(tk.END, log_buffer[i] + '\n')
-            self.log_text.see(tk.END)
-            self.log_text.config(state='disabled')
-            self.log_update_idx = len(log_buffer)
-        
-        self.after(1000, self.update_logs)
+        try:
+            if len(log_buffer) > self.log_update_idx:
+                self.log_text.config(state='normal')
+                for i in range(self.log_update_idx, len(log_buffer)):
+                    self.log_text.insert(tk.END, log_buffer[i] + '\n')
+                self.log_text.see(tk.END)
+                self.log_text.config(state='disabled')
+                self.log_update_idx = len(log_buffer)
+        except (tk.TclError, RuntimeError) as e:
+            # Widget destroyed or Tk not available
+            logging.debug(f"Log widget error: {e}")
+        except Exception as e:
+            logging.error(f"Error updating logs: {e}")
+        finally:
+            # Always reschedule even if there was an error
+            self.after(1000, self.update_logs)
     
     def update_status_bar(self):
         """Update status bar with system information."""
-        # Use shared thread pool to fetch system counts
-        def _fetch():
-            with docker_lock:
-                containers = client.containers.list(all=True)
-                running = sum(1 for c in containers if c.status == 'running')
-                total = len(containers)
-                images = len(client.images.list())
-                volumes = len(client.volumes.list())
-                networks = len(client.networks.list())
-            return (running, total, images, volumes, networks)
+        try:
+            # Use shared thread pool to fetch system counts
+            def _fetch():
+                with docker_lock:
+                    containers = client.containers.list(all=True)
+                    running = sum(1 for c in containers if c.status == 'running')
+                    total = len(containers)
+                    images = len(client.images.list())
+                    volumes = len(client.volumes.list())
+                    networks = len(client.networks.list())
+                return (running, total, images, volumes, networks)
 
-        def _on_done(result):
-            running, total, images, volumes, networks = result
-            status_text = f"Ready | 🐳 Docker: {running}/{total} containers running | 🖼️ {images} images | 💾 {volumes} volumes | 🌐 {networks} networks"
-            self.status_bar.config(text=status_text)
+            def _on_done(result):
+                try:
+                    running, total, images, volumes, networks = result
+                    status_text = f"Ready | 🐳 Docker: {running}/{total} containers running | 🖼️ {images} images | 💾 {volumes} volumes | 🌐 {networks} networks"
+                    self.status_bar.config(text=status_text)
+                except (tk.TclError, RuntimeError):
+                    # Widget destroyed
+                    pass
+                except Exception as e:
+                    logging.debug(f"Error updating status bar text: {e}")
 
-        def _on_error(e):
-            logging.error(f"Error updating status bar: {e}")
+            def _on_error(e):
+                logging.debug(f"Error fetching status bar data: {e}")
 
-        run_in_thread(_fetch, on_done=_on_done, on_error=_on_error, tk_root=self)
-        # Schedule next update
-        self.after(5000, self.update_status_bar)
+            run_in_thread(_fetch, on_done=_on_done, on_error=_on_error, tk_root=self)
+        except Exception as e:
+            logging.error(f"Error in update_status_bar: {e}")
+        finally:
+            # Schedule next update (always reschedule)
+            self.after(5000, self.update_status_bar)
     
     def set_status(self, message, duration=3000):
         """Set temporary status message."""

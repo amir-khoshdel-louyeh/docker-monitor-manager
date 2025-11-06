@@ -4,7 +4,6 @@ Post-installation script for Docker Monitor Manager
 This script installs desktop entry and icon across different platforms
 """
 
-import os
 import sys
 import shutil
 import platform
@@ -23,7 +22,7 @@ def get_package_path():
 
 def install_linux():
     """Install desktop entry and icon on Linux"""
-    package_path = get_package_path()
+    _ = get_package_path()
     
     # Setup directories
     local_share = Path.home() / ".local" / "share"
@@ -130,7 +129,7 @@ def install_linux():
 
 def install_macos():
     """Install app bundle on macOS"""
-    package_path = get_package_path()
+    _ = get_package_path()
     setup_tools_dir = Path(__file__).parent
     
     # Try to install icon to user's icon directory
@@ -161,7 +160,7 @@ def install_macos():
 
 def install_windows():
     """Install shortcuts on Windows"""
-    package_path = get_package_path()
+    _ = get_package_path()
     setup_tools_dir = Path(__file__).parent
     
     # Try to copy icon to a user-accessible location
@@ -189,7 +188,6 @@ def install_windows():
         shortcut_path = start_menu / "Docker Monitor Manager.lnk"
         
         # Find Python executable and icon
-        python_exe = sys.executable
         script_path = shutil.which("docker-monitor-manager")
         icon_path = str(home / ".icons" / "docker-monitor-manager.ico")
         

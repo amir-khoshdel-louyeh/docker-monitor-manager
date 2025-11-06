@@ -3,17 +3,14 @@ Network Manager Module
 Handles all network-related operations including listing, creation, removal, and container connections.
 """
 
+import docker
+import queue
 import logging
-"""
-Network Manager Module
-Handles all network-related operations including listing, creation, removal, and container connections.
-"""
-
-import logging
-import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 from docker_monitor.utils.docker_utils import client, docker_lock, network_refresh_queue
+from docker_monitor.utils.docker_controller import get_docker_controller
+from docker_monitor.utils.worker import run_in_thread
 
 
 class NetworkManager:
@@ -47,7 +44,20 @@ class NetworkManager:
         """Fetch networks and put in refresh queue."""
         net_list = NetworkManager.fetch_networks()
         if net_list is not None:
-            network_refresh_queue.put(net_list)
+            try:
+                network_refresh_queue.put_nowait(net_list)
+            except queue.Full:
+                try:
+                    network_refresh_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    network_refresh_queue.put_nowait(net_list)
+                except queue.Full:
+                    logging.debug("Network refresh queue saturated; dropping update")
+            # Also notify controller (Observer pattern)
+            controller = get_docker_controller()
+            controller.update_networks(net_list)
     
     @staticmethod
     def update_network_tree(tree, net_list, tree_tags_configured, bg_color, frame_bg):
@@ -75,17 +85,21 @@ class NetworkManager:
             item = tree.item(current_selection[0])
             selected_values = item['values']
         
-        # Clear existing items
-        for item in tree.get_children():
-            tree.delete(item)
+        # Clear existing items using map - faster than loop
+        list(map(tree.delete, tree.get_children()))
         
-        # Insert networks
-        for idx, net in enumerate(net_list):
-            tag = 'evenrow' if idx % 2 == 0 else 'oddrow'
-            iid = tree.insert('', tk.END, values=(net['id'], net['name'], net['driver'], net['scope']), tags=(tag,))
-            
-            # Restore selection if this matches the previously selected item
-            if selected_values and selected_values[0] == net['id']:
+        # Prepare all network data first (batch operation)
+        network_data = [
+            ((net['id'], net['name'], net['driver'], net['scope']), 
+             ('evenrow' if idx % 2 == 0 else 'oddrow',),
+             selected_values and selected_values[0] == net['id'])
+            for idx, net in enumerate(net_list)
+        ]
+        
+        # Insert networks and track selection
+        for values, tags, should_select in network_data:
+            iid = tree.insert('', tk.END, values=values, tags=tags)
+            if should_select:
                 tree.selection_set(iid)
         
         return tree_tags_configured
@@ -114,7 +128,7 @@ class NetworkManager:
         ]
     
     @staticmethod
-    def create_network(name_callback, driver_callback, success_callback):
+    def create_network(name_callback, driver_callback, success_callback, tk_root=None):
         """Create a new Docker network.
         
         Args:
@@ -129,18 +143,45 @@ class NetworkManager:
         driver = driver_callback()
         if not driver:
             driver = 'bridge'
-        
-        try:
-            with docker_lock:
-                client.networks.create(name, driver=driver)
-            logging.info(f"Created network {name} (driver={driver}).")
-            if success_callback:
-                success_callback()
-        except Exception as e:
-            logging.error(f"Failed to create network {name}: {e}")
+        controller = get_docker_controller()
+
+        def _create():
+            success = False
+            error_msg = None
+            try:
+                with docker_lock:
+                    client.networks.create(name, driver=driver)
+                logging.info(f"Created network {name} (driver={driver}).")
+                success = True
+            except Exception as exc:
+                error_msg = str(exc)
+                logging.error(f"Failed to create network {name}: {exc}")
+
+            controller.notify_network_action('create', name, success, error_msg)
+
+            if success:
+                NetworkManager.fetch_networks_for_refresh()
+
+            return success, error_msg
+
+        def _after_create(result):
+            success, error_msg = result
+            if success:
+                if success_callback:
+                    success_callback()
+            else:
+                messagebox.showerror('Error', f'Failed to create network:\n{error_msg}')
+
+        run_in_thread(
+            _create,
+            on_done=_after_create,
+            on_error=lambda exc: logging.error(f'Network creation worker failed: {exc}'),
+            tk_root=tk_root,
+            block=False,
+        )
     
     @staticmethod
-    def remove_network(network_name, confirm_callback):
+    def remove_network(network_name, confirm_callback, tk_root=None):
         """Remove a Docker network.
         
         Args:
@@ -149,14 +190,41 @@ class NetworkManager:
         """
         if not confirm_callback(f"Remove network '{network_name}'? This may disconnect containers."):
             return
-        
-        try:
-            with docker_lock:
-                net = client.networks.get(network_name)
-                net.remove()
-            logging.info(f"Removed network {network_name}.")
-        except Exception as e:
-            logging.error(f"Error removing network '{network_name}': {e}")
+
+        controller = get_docker_controller()
+
+        def _remove():
+            success = False
+            error_msg = None
+            try:
+                with docker_lock:
+                    net = client.networks.get(network_name)
+                    net.remove()
+                logging.info(f"Removed network {network_name}.")
+                success = True
+            except Exception as exc:
+                error_msg = str(exc)
+                logging.error(f"Error removing network '{network_name}': {exc}")
+
+            controller.notify_network_action('remove', network_name, success, error_msg)
+
+            if success:
+                NetworkManager.fetch_networks_for_refresh()
+
+            return success, error_msg
+
+        def _after_remove(result):
+            success, error_msg = result
+            if not success:
+                messagebox.showerror('Error', f"Failed to remove network '{network_name}':\n{error_msg}")
+
+        run_in_thread(
+            _remove,
+            on_done=_after_remove,
+            on_error=lambda exc: logging.error(f'Network removal worker failed: {exc}'),
+            tk_root=tk_root,
+            block=False,
+        )
     
     @staticmethod
     def prune_networks(confirm_callback, status_callback):
@@ -188,8 +256,8 @@ class NetworkManager:
                 if status_callback:
                     status_callback("❌ Error pruning networks")
         
-            from docker_monitor.utils.worker import run_in_thread
-            run_in_thread(prune, on_done=None, on_error=lambda e: logging.error(f"Prune failed: {e}"), tk_root=None, block=True)
+        from docker_monitor.utils.worker import run_in_thread
+        run_in_thread(prune, on_done=None, on_error=lambda e: logging.error(f"Prune failed: {e}"), tk_root=None, block=False)
     
     @staticmethod
     def get_network_info(network_name):
@@ -391,8 +459,9 @@ class NetworkManager:
                     try:
                         container = client.containers.get(container_id)
                         connected.append(container)
-                    except:
-                        pass
+                    except (docker.errors.NotFound, docker.errors.APIError) as e:
+                        # Container may have been removed or Docker API error
+                        logging.debug(f"Container {container_id} not found or API error: {e}")
                 return connected
         except Exception as e:
             logging.error(f"Error getting connected containers: {e}")

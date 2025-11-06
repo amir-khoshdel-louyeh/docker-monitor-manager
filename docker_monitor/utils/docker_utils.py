@@ -4,6 +4,9 @@ import logging
 import queue
 import threading
 
+# Import the Docker Data Controller
+from docker_monitor.utils.docker_controller import get_docker_controller
+
 # --- Configuration ---
 CPU_LIMIT = 50.0  # %
 RAM_LIMIT = 5.0   # %
@@ -31,12 +34,27 @@ except Exception as e:
 
 
 # Queues for inter-thread communication
-stats_queue = queue.Queue()
+stats_queue = queue.Queue(maxsize=5)
 manual_refresh_queue = queue.Queue()  # A dedicated queue for manual refresh results
-network_refresh_queue = queue.Queue()
-logs_stream_queue = queue.Queue()
-events_queue = queue.Queue()
+network_refresh_queue = queue.Queue(maxsize=5)
+logs_stream_queue = queue.Queue(maxsize=20)
+events_queue = queue.Queue(maxsize=50)
 docker_lock = threading.Lock()  # A lock to prevent race conditions on Docker operations
+
+
+def _offer_latest(q: queue.Queue, item, queue_name: str) -> None:
+    """Drop oldest entry when the bounded queue is full and enqueue the latest snapshot."""
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            logging.debug(f"{queue_name} queue saturated; dropping update")
 
 
 def calculate_cpu_percent(stats):
@@ -76,8 +94,31 @@ def calculate_ram_percent(stats):
 
 
 def get_container_stats(container):
-    """Get stats for a single container."""
+    """Get stats for a single container with timeout protection."""
+    if container is None:
+        logging.warning("get_container_stats called with None container")
+        return {
+            'id': 'unknown', 
+            'name': 'unknown', 
+            'status': 'error', 
+            'cpu': '0.00', 
+            'ram': '0.00'
+        }
+    
     try:
+        # Only fetch stats for running containers to improve performance
+        # For stopped containers, just return basic info
+        if container.status != 'running':
+            return {
+                'id': container.short_id,
+                'name': container.name,
+                'status': container.status,
+                'cpu': '0.00',
+                'ram': '0.00'
+            }
+        
+        # Fetch stats with a timeout to prevent hanging
+        # Use stream=False for non-blocking single stat fetch
         stats = container.stats(stream=False)
 
         cpu = calculate_cpu_percent(stats)
@@ -89,14 +130,29 @@ def get_container_stats(container):
             'cpu': f"{cpu:.2f}",
             'ram': f"{ram:.2f}"
         }
-    except Exception:
-        return {
-            'id': container.short_id, 
-            'name': container.name, 
-            'status': 'error', 
-            'cpu': '0.00', 
-            'ram': '0.00'
-        }
+    except docker.errors.NotFound:
+        # Container was removed while we were fetching stats
+        logging.debug(f"Container {getattr(container, 'name', 'unknown')} not found (likely removed)")
+        return None
+    except Exception as e:
+        logging.debug(f"Error getting stats for container {getattr(container, 'name', 'unknown')}: {e}")
+        # Return basic info instead of erroring out
+        try:
+            return {
+                'id': container.short_id,
+                'name': container.name,
+                'status': container.status,
+                'cpu': '0.00',
+                'ram': '0.00'
+            }
+        except:
+            return {
+                'id': 'unknown', 
+                'name': 'unknown', 
+                'status': 'error', 
+                'cpu': '0.00', 
+                'ram': '0.00'
+            }
 
 
 def is_clone_container(container):
@@ -104,33 +160,58 @@ def is_clone_container(container):
     Check if a container is a clone created by this application.
     Uses labels to identify clone containers reliably.
     """
+    if container is None:
+        return False
+    
     try:
         labels = container.labels or {}
         return labels.get('dmm.is_clone') == 'true' and 'dmm.parent_container' in labels
-    except Exception:
+    except (AttributeError, TypeError) as e:
+        logging.debug(f"Error checking if container is clone: {e}")
         return False
 
 
 def get_parent_container_name(container):
     """Get the parent container name from a clone container."""
+    if container is None:
+        return ''
+    
     try:
         labels = container.labels or {}
         return labels.get('dmm.parent_container', '')
-    except Exception:
+    except (AttributeError, TypeError) as e:
+        logging.debug(f"Error getting parent container name: {e}")
         return ''
 
 
 def delete_clones(container, all_containers):
     """Delete all clone containers for a given container."""
-    container_name = container.name
+    if container is None or all_containers is None:
+        logging.warning("delete_clones called with None parameter")
+        return
+    
+    try:
+        container_name = container.name
+    except AttributeError:
+        logging.error("Container object has no 'name' attribute")
+        return
+    
+    # Use list comprehension to filter clones - faster than manual loop
     existing_clones = [c for c in all_containers if is_clone_container(c) and get_parent_container_name(c) == container_name]
-    for clone in existing_clones:
+    
+    # Define deletion function once to avoid repeated try-catch overhead
+    def delete_clone(clone):
         try:
-            clone.stop()
+            clone.stop(timeout=10)
             clone.remove()
             logging.info(f"Deleted clone container {clone.name}.")
+        except docker.errors.NotFound:
+            logging.debug(f"Clone container {getattr(clone, 'name', 'unknown')} already removed")
         except Exception as e:
-            logging.error(f"Failed to delete clone container {clone.name}: {e}")
+            logging.error(f"Failed to delete clone container {getattr(clone, 'name', 'unknown')}: {e}")
+    
+    # Apply deletion using map (avoids explicit loop)
+    list(map(delete_clone, existing_clones))
 
 
 def docker_cleanup():
@@ -167,7 +248,16 @@ def docker_cleanup():
 
 def scale_container(container, all_containers):
     """Scale a container by creating clones."""
-    container_name = container.name
+    if container is None or all_containers is None:
+        logging.warning("scale_container called with None parameter")
+        return
+    
+    try:
+        container_name = container.name
+    except AttributeError:
+        logging.error("Container object has no 'name' attribute")
+        return
+    
     existing_clones = [c for c in all_containers if is_clone_container(c) and get_parent_container_name(c) == container_name]
 
     if len(existing_clones) >= CLONE_NUM:
@@ -175,15 +265,16 @@ def scale_container(container, all_containers):
         try:
             container.pause()
             logging.info(f"Paused original container '{container_name}'.")
-        except Exception as e:
+        except docker.errors.APIError as e:
             logging.error(f"Failed to pause original container '{container_name}': {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error pausing container '{container_name}': {e}")
         delete_clones(container, all_containers)
         # Schedule cleanup via shared worker to avoid raw thread storms
         from docker_monitor.utils.worker import run_in_thread
         run_in_thread(docker_cleanup, on_done=None, on_error=lambda e: logging.error(f"Cleanup failed: {e}"), tk_root=None, block=False)
         return
 
-    clone_name = f"{container_name}_clone{len(existing_clones) + 1}"
     # If auto-scaling is disabled, do not create clones automatically.
     if not AUTO_SCALE_ENABLED:
         logging.info(f"Auto-scaling is disabled; skipping clone creation for '{container_name}'")
@@ -200,32 +291,59 @@ def scale_container(container, all_containers):
 def monitor_thread():
     """Background thread for monitoring Docker containers."""
     global SLEEP_TIME
+    
+    # Get the Docker controller instance
+    controller = get_docker_controller()
 
     while True:
-        with docker_lock:
-            try:
+        try:
+            with docker_lock:
                 all_containers = client.containers.list(all=True)
-                stats_list = []
-                for container in all_containers:
-                    stats = get_container_stats(container)
-                    stats_list.append(stats)
 
-                    # --- Auto-scaling logic ---
-                    # Only consider 'running' containers for scaling to avoid race conditions with paused ones.
-                    if container.status == 'running':
-                        cpu_float = float(stats['cpu'])
-                        ram_float = float(stats['ram'])
+            container_stats_pairs = []
+            stats_payload = []
+            for container in all_containers:
+                stats = get_container_stats(container)
+                container_stats_pairs.append((container, stats))
+                if stats is not None:
+                    stats_payload.append(stats)
 
-                        # Only scale if it's not a clone container (check using labels, not name)
-                        if (cpu_float > CPU_LIMIT or ram_float > RAM_LIMIT) and not is_clone_container(container):
-                            logging.info(f"Container {container.name} overloaded (CPU: {cpu_float:.2f}%, RAM: {ram_float:.2f}%). Scaling...")
-                            scale_container(container, all_containers)
-                            
-                # Put the entire list into the queue for the GUI to process
-                stats_queue.put(stats_list)
+            # --- Auto-scaling logic ---
+            if AUTO_SCALE_ENABLED:
+                running_overloaded = []
+                for container, stats in container_stats_pairs:
+                    if not stats:
+                        continue
+                    if container.status != 'running' or is_clone_container(container):
+                        continue
+                    try:
+                        cpu_val = float(stats.get('cpu', 0.0))
+                        ram_val = float(stats.get('ram', 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    if cpu_val > CPU_LIMIT or ram_val > RAM_LIMIT:
+                        running_overloaded.append((container, stats))
 
-            except Exception as e:
-                logging.error(f"Error in monitor loop: {e}")
+                for container, stats in running_overloaded:
+                    try:
+                        logging.info(
+                            "Container %s overloaded (CPU: %s%%, RAM: %s%%). Scaling...",
+                            container.name,
+                            stats.get('cpu', 'n/a'),
+                            stats.get('ram', 'n/a')
+                        )
+                        scale_container(container, all_containers)
+                    except (ValueError, KeyError, AttributeError) as e:
+                        logging.debug(f"Error processing stats for {container.name}: {e}")
+
+            # Notify controller with updated container data (Observer pattern)
+            controller.update_containers(stats_payload)
+
+            # Also put in queue for backward compatibility during transition
+            _offer_latest(stats_queue, stats_payload, "stats")
+
+        except Exception as e:
+            logging.error(f"Error in monitor loop: {e}")
         
         time.sleep(SLEEP_TIME)
 
@@ -237,8 +355,15 @@ def docker_events_listener():
     """
     logging.info("Docker events listener started")
     
+    # Get the Docker controller instance
+    controller = get_docker_controller()
+    
     # Events we care about for immediate UI updates
     relevant_events = ['create', 'start', 'stop', 'die', 'destroy', 'pause', 'unpause', 'kill', 'restart']
+    
+    # Debounce rapid events to prevent overwhelming the system
+    last_refresh_time = 0
+    MIN_REFRESH_INTERVAL = 0.5  # Minimum 500ms between refreshes
     
     try:
         for event in client.events(decode=True):
@@ -265,6 +390,17 @@ def docker_events_listener():
                     continue
 
                 logging.info(f"Docker event detected: {event_action} on container '{container_name}'")
+                
+                # Notify controller about the Docker event (Observer pattern)
+                controller.notify_docker_event(event)
+
+                # Debounce: Only refresh if enough time has passed since last refresh
+                current_time = time.time()
+                if current_time - last_refresh_time < MIN_REFRESH_INTERVAL:
+                    logging.debug(f"Skipping refresh due to debounce (last refresh {current_time - last_refresh_time:.2f}s ago)")
+                    continue
+                
+                last_refresh_time = current_time
 
                 # For some rapid create/start/destroy sequences the SDK may return
                 # a NotFound when trying to inspect a container that already went
@@ -272,45 +408,69 @@ def docker_events_listener():
                 # sleep a tiny amount for create/start events before listing.
                 if event_action in ('create', 'start'):
                     # short debounce to let the container settle
-                    time.sleep(0.05)
+                    time.sleep(0.1)
 
                 # Trigger an immediate refresh by fetching current stats for app containers only
-                with docker_lock:
-                    try:
-                        all_containers = client.containers.list(all=True)
-                        stats_list = []
-                        for container in all_containers:
-                            try:
-                                stats = get_container_stats(container)
-                                stats_list.append(stats)
-                            except docker.errors.NotFound:
-                                # Container disappeared between list and inspect - expected
-                                logging.debug(f"Container disappeared before stats could be read: {container.name}")
-                            except Exception as e:
-                                logging.error(f"Error getting stats for {getattr(container, 'name', container.short_id)}: {e}")
+                # Use a timeout to prevent hanging
+                def _fetch_and_notify():
+                    with docker_lock:
+                        try:
+                            all_containers = client.containers.list(all=True)
+                            
+                            # Use list comprehension with error handling - much faster than loop
+                            def safe_get_stats(c):
+                                try:
+                                    return get_container_stats(c)
+                                except docker.errors.NotFound:
+                                    logging.debug(f"Container disappeared before stats could be read: {getattr(c, 'name', 'unknown')}")
+                                    return None
+                                except Exception as e:
+                                    logging.debug(f"Error getting stats for {getattr(c, 'name', 'unknown')}: {e}")
+                                    return None
+                            
+                            stats_list = [s for s in (safe_get_stats(c) for c in all_containers) if s is not None]
 
-                        # Put the stats in the queue for immediate GUI update
-                        stats_queue.put(stats_list)
+                            # Notify controller with updated container data (Observer pattern)
+                            controller.update_containers(stats_list)
+                            
+                            # Also put in queue for backward compatibility
+                            _offer_latest(stats_queue, stats_list, "stats")
+                            _offer_latest(manual_refresh_queue, stats_list, "manual refresh")
 
-                        # If the container was destroyed, schedule cleanup to free resources
-                        if event_action == 'destroy':
-                            from docker_monitor.utils.worker import run_in_thread
-                            run_in_thread(docker_cleanup, on_done=None, on_error=lambda e: logging.error(f"Cleanup failed: {e}"), tk_root=None, block=False)
+                            # If the container was destroyed, schedule cleanup to free resources
+                            if event_action == 'destroy':
+                                from docker_monitor.utils.worker import run_in_thread
+                                run_in_thread(docker_cleanup, on_done=None, on_error=lambda e: logging.error(f"Cleanup failed: {e}"), tk_root=None, block=False)
 
-                    except docker.errors.NotFound as e:
-                        # This can happen if a specific container referenced in the
-                        # SDK query was removed concurrently. Treat as debug-worthy
-                        # rather than an error to avoid alarming logs for races.
-                        logging.debug(f"NotFound while processing event {event_action}: {e}")
-                    except Exception as e:
-                        logging.error(f"Error processing event {event_action}: {e}")
+                        except docker.errors.NotFound as e:
+                            # This can happen if a specific container referenced in the
+                            # SDK query was removed concurrently. Treat as debug-worthy
+                            # rather than an error to avoid alarming logs for races.
+                            logging.debug(f"NotFound while processing event {event_action}: {e}")
+                        except Exception as e:
+                            logging.error(f"Error processing event {event_action}: {e}")
+                
+                # Execute fetch in a separate thread to avoid blocking the event stream
+                from docker_monitor.utils.worker import run_in_thread
+                run_in_thread(_fetch_and_notify, on_done=None, on_error=lambda e: logging.error(f"Event refresh failed: {e}"), tk_root=None, block=False)
 
             except Exception as e:
                 logging.error(f"Error handling event: {e}")
 
     except Exception as e:
         logging.error(f"Docker events listener error: {e}")
-        # Restart the listener after a short delay
-        time.sleep(5)
-        logging.info("Restarting Docker events listener...")
-        docker_events_listener()
+        # Avoid infinite recursion - limit restart attempts
+        if not hasattr(docker_events_listener, '_restart_count'):
+            docker_events_listener._restart_count = 0
+        
+        docker_events_listener._restart_count += 1
+        max_restarts = 5
+        
+        if docker_events_listener._restart_count < max_restarts:
+            # Restart the listener after a short delay
+            time.sleep(5)
+            logging.info(f"Restarting Docker events listener (attempt {docker_events_listener._restart_count}/{max_restarts})...")
+            docker_events_listener()
+        else:
+            logging.critical(f"Docker events listener failed {max_restarts} times. Stopping automatic restarts.")
+            logging.critical("Please check Docker daemon status and restart the application.")

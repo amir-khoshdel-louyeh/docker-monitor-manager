@@ -6,6 +6,7 @@ Command-line interface for complete uninstallation
 
 import sys
 import subprocess
+import logging
 from pathlib import Path
 
 
@@ -18,8 +19,9 @@ def main():
             import docker_monitor
             pkg_dir = Path(docker_monitor.__file__).parent.parent
             uninstall_script = pkg_dir / "setup_tools" / "uninstall.py"
-        except:
+        except (ImportError, AttributeError, OSError) as e:
             # Fallback: assume we're in development mode
+            logging.debug(f"Could not find installed package: {e}")
             uninstall_script = Path(__file__).parent.parent.parent / "setup_tools" / "uninstall.py"
         
         if not uninstall_script.exists():

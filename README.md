@@ -6,7 +6,8 @@ This repository provides a GUI application and helpful CLI tools for Docker mana
 
 - `docker-monitor-manager` / `dmm` - Desktop GUI application
 - `dmm-config` - System configuration helper
-- `dmm-doctor` - Health checker and auto-fixer
+- `dmm-doctor` - Health checker with guided fixes
+- `dmm-cleanup` - Docker maintenance and cleanup helper
 - `dmm-test` - Test environment creator
 - `dmm-setup` - Post-installation setup (desktop entry & icons)
 - `dmm-update` - Update to the latest version from PyPI
@@ -25,7 +26,7 @@ This repository provides a GUI application and helpful CLI tools for Docker mana
 - Comprehensive CLI tools for system configuration, health checking, and maintenance.
 - Built-in help system (`dmm-help`) that provides detailed documentation for all commands.
 - Auto-update functionality (`dmm-update`) to easily upgrade to the latest version.
-- A conservative CLI helper (`dmm-doctor`) that can detect Docker and AppArmor issues and optionally help fix them on supported systems.
+- A guided CLI helper (`dmm-doctor`) that diagnoses Docker/AppArmor issues and reclaims memory held by orphaned containers when safe.
 
 ---
 
@@ -127,29 +128,26 @@ dmm-help doctor    # example: get help about dmm-doctor
 
 ```bash
 dmm-update         # update from PyPI
-dmm-update --force # force reinstall
 ```
 
-#### 🏥 Check system health and auto-fix issues:
+#### 🏥 Check system health and get guidance:
 
 ```bash
-dmm-doctor         # diagnose issues
-dmm-doctor --fix   # diagnose and auto-fix
+dmm-doctor         # diagnose issues and get fix guidance
 ```
 
 #### ⚙️ Configure Docker installation:
 
 ```bash
-dmm-config         # interactive (prompts before making changes)
-dmm-config --yes   # non-interactive (accept prompts)
+dmm-config         # runs helper actions automatically when required
 ```
 
 #### 🧪 Create test environment:
 
 ```bash
 dmm-test           # create test containers
-dmm-test --status  # check status
-dmm-test --cleanup # remove test containers
+dmm-test status    # check status
+dmm-test cleanup   # remove test containers
 ```
 
 #### 🗑️ Uninstall completely:
@@ -168,7 +166,8 @@ dmm-uninstall      # remove application, icons, and desktop entries
 | `dmm-help <command>` | Show detailed help for a command | `dmm-help doctor` |
 | `dmm-update` | Update to the latest version | `dmm-update` |
 | `dmm-setup` | Run post-installation setup | `dmm-setup` |
-| `dmm-doctor` | Check system health | `dmm-doctor --fix` |
+| `dmm-doctor` | Check system health | `dmm-doctor` |
+| `dmm-cleanup` | Prune Docker resources | `dmm-cleanup` |
 | `dmm-config` | Configure Docker installation | `dmm-config` |
 | `dmm-test` | Create test containers | `dmm-test` |
 | `dmm-uninstall` | Uninstall the application | `dmm-uninstall` |
@@ -177,7 +176,8 @@ dmm-uninstall      # remove application, icons, and desktop entries
 ```bash
 dmm-help           # Get help anytime
 dmm-update         # Stay up to date
-dmm-doctor --fix   # Fix any issues
+dmm-doctor         # Review diagnostics and suggestions
+dmm-cleanup        # Prune unused resources
 dmm                # Run the application
 ```
 
@@ -195,12 +195,15 @@ pip install docker-monitor-manager
 dmm-setup
 
 # 3. Check system health
-dmm-doctor --fix
+dmm-doctor
 
 # 4. (Optional) Create test environment
 dmm-test
 
-# 5. Launch the application
+# 5. (Optional) Cleanup unused Docker resources
+dmm-cleanup
+
+# 6. Launch the application
 dmm
 ```
 
@@ -244,11 +247,10 @@ Update Docker Monitor Manager to the latest version from PyPI.
 **Usage**:
 ```bash
 dmm-update         # update to latest version
-dmm-update --force # force reinstall even if already latest
 ```
 
 ### 🏥 `dmm-doctor`
-Health checker and auto-fixer for common Docker issues.
+Health checker that diagnoses common Docker issues, suggests fixes, and frees memory from orphaned container shims when possible.
 
 **Checks**:
 - ✓ Docker installation
@@ -258,11 +260,26 @@ Health checker and auto-fixer for common Docker issues.
 - ✓ Docker socket accessibility
 - ✓ Network connectivity
 - ✓ System resources
+- ✓ Orphaned container shims (reclaims memory when safe)
 
 **Usage**:
 ```bash
-dmm-doctor         # diagnose only
-dmm-doctor --fix   # auto-fix issues
+dmm-doctor         # run diagnostics and receive guidance
+```
+
+### 🧹 `dmm-cleanup`
+Prune unused Docker resources and reclaim memory from stray container shims.
+
+**Tasks**:
+- Removes stopped containers (`docker container prune`)
+- Removes dangling images (`docker image prune`)
+- Removes unused networks (`docker network prune`)
+- Removes unused volumes (`docker volume prune`)
+- Terminates orphaned containerd shim processes to free RAM
+
+**Usage**:
+```bash
+dmm-cleanup        # run all cleanup tasks
 ```
 
 ### 🧪 `dmm-test`
@@ -278,10 +295,8 @@ Create test Docker containers for verifying the application works correctly.
 **Usage**:
 ```bash
 dmm-test           # create all test containers
-dmm-test --cpu     # create only CPU stress
-dmm-test --memory  # create only memory stress
-dmm-test --status  # show container status
-dmm-test --cleanup # remove all test containers
+dmm-test status    # show container status
+dmm-test cleanup   # remove all test containers
 ```
 
 ### ⚙️ `dmm-config`
@@ -294,8 +309,7 @@ Interactive system configuration helper.
 
 **Usage**:
 ```bash
-dmm-config         # interactive mode
-dmm-config --yes   # auto-accept all prompts
+dmm-config         # run configuration helper
 ```
 
 ### 🗑️ `dmm-uninstall`
@@ -322,15 +336,15 @@ dmm-uninstall      # interactive uninstall (auto-detects installation method)
 
 ## dmm-config — quick reference
 
-`dmm-config` is a small CLI tool included in the package. It performs checks and (optionally) fixes common issues required for this app to talk to Docker.
+`dmm-config` is a small CLI tool included in the package. It performs checks and applies helper actions needed for this app to talk to Docker.
 
 What it does
 - Detects whether `docker` is available on PATH (`docker --version`).
-- On Linux it can attempt to install Docker via the distro package manager (or suggest the official install script) and can offer to install AppArmor utilities when appropriate.
-- If `/etc/apparmor.d/docker` exists, it can offer to switch the profile to `complain` or `disable` using `aa-complain` / `aa-disable`.
+- On Linux it can attempt to install Docker via the distro package manager (or use the official install script) and installs AppArmor utilities when appropriate.
+- If `/etc/apparmor.d/docker` exists, it switches the profile to `complain` and `disable` using `aa-complain` / `aa-disable`.
 
 Security & behavior
-- The helper is conservative — it asks before making system changes. Use `--yes` only when you trust the environment and want automatic changes.
+- The helper performs required actions automatically and prints the commands it runs. Ensure you understand the changes before executing it on shared systems.
 
 Manual AppArmor commands (Debian/Ubuntu example)
 ```bash
@@ -348,7 +362,7 @@ sudo aa-disable /etc/apparmor.d/docker
 **Need help?** Run `dmm-help` to see all available commands and their usage.
 
 - **"permission denied" when accessing Docker:**
-	- Run `dmm-doctor --fix` to automatically diagnose and fix the issue.
+	- Run `dmm-doctor` to diagnose the issue and follow the suggested steps.
 	- Or manually: Ensure the Docker daemon is running: `sudo systemctl start docker` (or use your distro's service manager).
 	- Add your user to the `docker` group and re-login: `sudo usermod -aG docker $USER` then logout/login or `newgrp docker`.
 	- If AppArmor is interfering, use `dmm-config` to inspect and optionally change the Docker AppArmor profile.
@@ -385,7 +399,7 @@ Source layout and important files
 - `docker_monitor/main.py` — main GUI application and console entry point.
 - `docker_monitor/cli/` — CLI tools directory:
   - `config.py` — `dmm-config` system configuration helper.
-  - `doctor.py` — `dmm-doctor` health checker and auto-fixer.
+	- `doctor.py` — `dmm-doctor` health checker with guided fixes.
   - `test.py` — `dmm-test` test environment creator.
   - `setup.py` — `dmm-setup` post-installation setup.
   - `update.py` — `dmm-update` auto-updater.
@@ -393,7 +407,7 @@ Source layout and important files
   - `uninstall.py` — `dmm-uninstall` complete uninstaller.
 - `docker_monitor/gui/` — GUI components (app, managers, widgets).
 - `docker_monitor/utils/` — Utility modules (Docker utils, buffer handler).
-- `requirements.txt` / `pyproject.toml` — declare runtime dependencies (notably `docker` and `Pillow`).
+- `requirements.txt` / `pyproject.toml` — declare runtime dependencies (notably `docker`, `Pillow`, and `psutil`).
 
 ---
 

@@ -4,9 +4,7 @@ Handles Docker system operations, dashboard updates, disk usage, and system repo
 """
 
 import datetime
-import json
 import logging
-import threading
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, filedialog
 
@@ -88,7 +86,7 @@ class SystemManager:
                 status_bar.after(0, status_bar.config, {"text": "✅ System pruned successfully"})
                 status_bar.after(0, refresh_callback)
             except Exception as e:
-                status_bar.after(0, lambda: logging.error(f"❌ Error: {e}"))
+                status_bar.after(0, lambda err=e: logging.error(f"❌ Error: {err}"))
                 status_bar.after(0, status_bar.config, {"text": f"❌ Prune failed: {e}"})
         
         from docker_monitor.utils.worker import run_in_thread
@@ -170,7 +168,7 @@ class SystemManager:
                 status_bar.after(0, lambda: logging.info("✅ Info refreshed"))
                 status_bar.after(0, status_bar.config, {"text": "✅ Docker info loaded"})
             except Exception as e:
-                status_bar.after(0, lambda: logging.error(f"❌ Error: {e}"))
+                status_bar.after(0, lambda err=e: logging.error(f"❌ Error: {err}"))
                 status_bar.after(0, status_bar.config, {"text": f"❌ Error loading info"})
         
         from docker_monitor.utils.worker import run_in_thread
@@ -225,7 +223,7 @@ class SystemManager:
                 status_bar.after(0, lambda: logging.info("✅ Disk usage loaded"))
                 status_bar.after(0, status_bar.config, {"text": "✅ Disk usage checked"})
             except Exception as e:
-                status_bar.after(0, lambda: logging.error(f"❌ Error: {e}"))
+                status_bar.after(0, lambda err=e: logging.error(f"❌ Error: {err}"))
                 status_bar.after(0, status_bar.config, {"text": f"❌ Error checking disk usage"})
         
         from docker_monitor.utils.worker import run_in_thread
@@ -301,22 +299,28 @@ class SystemManager:
                     try:
                         containers = client.containers.list(all=True)
                         if containers:
+                            # Use list comprehension to build container info - faster than loop
+                            container_info = []
                             for container in containers:
-                                report_lines.append(f"\nContainer: {container.name}")
-                                report_lines.append(f"  ID: {container.short_id}")
-                                report_lines.append(f"  Status: {container.status}")
-                                report_lines.append(f"  Image: {container.image.tags[0] if container.image.tags else container.image.short_id}")
-                                report_lines.append(f"  Created: {container.attrs.get('Created', 'N/A')}")
+                                info = [
+                                    f"\nContainer: {container.name}",
+                                    f"  ID: {container.short_id}",
+                                    f"  Status: {container.status}",
+                                    f"  Image: {container.image.tags[0] if container.image.tags else container.image.short_id}",
+                                    f"  Created: {container.attrs.get('Created', 'N/A')}"
+                                ]
                                 
-                                # Ports
                                 ports = container.attrs.get('NetworkSettings', {}).get('Ports', {})
                                 if ports:
-                                    report_lines.append(f"  Ports: {ports}")
+                                    info.append(f"  Ports: {ports}")
                                 
-                                # Networks
                                 networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
                                 if networks:
-                                    report_lines.append(f"  Networks: {', '.join(networks.keys())}")
+                                    info.append(f"  Networks: {', '.join(networks.keys())}")
+                                
+                                container_info.extend(info)
+                            
+                            report_lines.extend(container_info)
                         else:
                             report_lines.append("No containers found.")
                     except Exception as e:
@@ -329,12 +333,15 @@ class SystemManager:
                     try:
                         images = client.images.list()
                         if images:
-                            for img in images:
-                                tags = img.tags if img.tags else ['<none>']
-                                report_lines.append(f"\nImage: {', '.join(tags)}")
-                                report_lines.append(f"  ID: {img.short_id}")
-                                report_lines.append(f"  Size: {img.attrs.get('Size', 0) / (1024**2):.2f} MB")
-                                report_lines.append(f"  Created: {img.attrs.get('Created', 'N/A')}")
+                            # Batch build image info using list comprehension
+                            image_info = [
+                                f"\nImage: {', '.join(img.tags if img.tags else ['<none>'])}\n"
+                                f"  ID: {img.short_id}\n"
+                                f"  Size: {img.attrs.get('Size', 0) / (1024**2):.2f} MB\n"
+                                f"  Created: {img.attrs.get('Created', 'N/A')}"
+                                for img in images
+                            ]
+                            report_lines.extend(image_info)
                         else:
                             report_lines.append("No images found.")
                     except Exception as e:
@@ -447,8 +454,8 @@ class SystemManager:
                 status_bar.after(0, status_bar.config, {"text": "✅ Report exported successfully"})
                 
             except Exception as e:
-                status_bar.after(0, lambda: logging.error(f"Failed to export system report: {e}"))
-                status_bar.after(0, lambda: messagebox.showerror('Error', f'Failed to export report:\n{e}'))
+                status_bar.after(0, lambda err=e: logging.error(f"Failed to export system report: {err}"))
+                status_bar.after(0, lambda err=e: messagebox.showerror('Error', f'Failed to export report:\n{err}'))
                 status_bar.after(0, status_bar.config, {"text": "❌ Export failed"})
         
         from docker_monitor.utils.worker import run_in_thread

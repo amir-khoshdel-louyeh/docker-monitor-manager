@@ -4,11 +4,9 @@ Handles all image-related operations including listing, pulling, removing, and i
 """
 
 import logging
-import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog, scrolledtext
-import json
 from docker_monitor.utils.docker_utils import client, docker_lock
+from docker_monitor.utils.docker_controller import get_docker_controller
 
 
 class ImageManager:
@@ -62,21 +60,30 @@ class ImageManager:
 
         # Use short IDs as unique identifiers
         current_short_ids = {i['id'][:12] for i in img_list}
-        for child in list(tree.get_children()):
-            if child not in current_short_ids:
-                tree.delete(child)
+        
+        # Batch delete using filter and map - faster than loop
+        to_delete = [child for child in tree.get_children() if child not in current_short_ids]
+        list(map(tree.delete, to_delete))
 
-        for img in img_list:
-            short_id = img['id'][:12]
-            repo = ','.join(img.get('repo_tags') or [])
-            values = (short_id, repo, img.get('size', ''), img.get('created', ''))
+        # Prepare image data in batch
+        image_updates = [
+            (img['id'][:12], 
+             (img['id'][:12], ','.join(img.get('repo_tags') or []), 
+              img.get('size', ''), img.get('created', '')))
+            for img in img_list
+        ]
+        
+        # Apply updates/inserts
+        for short_id, values in image_updates:
             if tree.exists(short_id):
                 tree.item(short_id, values=values)
             else:
                 tree.insert('', tk.END, iid=short_id, values=values)
 
-        for i, iid in enumerate(tree.get_children()):
-            tree.item(iid, tags=('evenrow' if i % 2 == 0 else 'oddrow',))
+        # Apply tags using map - faster than loop
+        children = tree.get_children()
+        list(map(lambda i_iid: tree.item(i_iid[1], tags=('evenrow' if i_iid[0] % 2 == 0 else 'oddrow',)), 
+                 enumerate(children)))
         
         # Restore selection if it still exists
         if selected_iid and tree.exists(selected_iid):
@@ -119,14 +126,74 @@ class ImageManager:
         if not confirm_callback(f'Remove image {image_id}?'):
             return False
         
+        controller = get_docker_controller()
+        success = False
+        error_msg = None
+        
         try:
             with docker_lock:
                 client.images.remove(image_id, force=True)
             logging.info(f"Removed image {image_id}")
-            return True
+            success = True
         except Exception as e:
+            error_msg = str(e)
             logging.error(f'Error removing image: {e}')
+        
+        # Notify controller
+        controller.notify_image_action('remove', image_id, success, error_msg)
+        
+        # Trigger refresh
+        if success:
+            img_list = ImageManager.fetch_images()
+            controller.update_images(img_list)
+        
+        return success
+    
+    @staticmethod
+    def tag_image(image_id, tag_callback, success_callback=None):
+        """Tag a Docker image with a new repository:tag name.
+        
+        Args:
+            image_id: ID of the image to tag
+            tag_callback: Function to get new tag from user
+            success_callback: Function to call on success
+        """
+        new_tag = tag_callback()
+        if not new_tag:
             return False
+        
+        controller = get_docker_controller()
+        success = False
+        error_msg = None
+        
+        try:
+            with docker_lock:
+                img = client.images.get(image_id)
+                # Parse repository and tag
+                if ':' in new_tag:
+                    repo, tag = new_tag.rsplit(':', 1)
+                else:
+                    repo, tag = new_tag, 'latest'
+                img.tag(repo, tag)
+            logging.info(f"Tagged image {image_id} as {new_tag}")
+            success = True
+            if success_callback:
+                success_callback()
+        except Exception as e:
+            error_msg = str(e)
+            logging.error(f'Error tagging image: {e}')
+            from tkinter import messagebox
+            messagebox.showerror('Error', f'Failed to tag image: {str(e)}')
+        
+        # Notify controller
+        controller.notify_image_action('tag', image_id, success, error_msg)
+        
+        # Trigger refresh
+        if success:
+            img_list = ImageManager.fetch_images()
+            controller.update_images(img_list)
+        
+        return success
     
     @staticmethod
     def pull_image(repo, success_callback=None):
@@ -191,8 +258,50 @@ class ImageManager:
                 if status_callback:
                     status_callback("❌ Error pruning images")
         
-            from docker_monitor.utils.worker import run_in_thread
-            run_in_thread(prune, on_done=None, on_error=lambda e: logging.error(f"Prune failed: {e}"), tk_root=None, block=True)
+        from docker_monitor.utils.worker import run_in_thread
+        run_in_thread(prune, on_done=None, on_error=lambda e: logging.error(f"Prune failed: {e}"), tk_root=None, block=True)
+    
+    @staticmethod
+    def remove_all_images(confirm_callback, status_callback, success_callback=None):
+        """Remove all images.
+        
+        Args:
+            confirm_callback: Function to get confirmation
+            status_callback: Function to update status
+            success_callback: Function to call on success
+        """
+        if not confirm_callback():
+            return
+        
+        logging.info("🗑️  Removing all images...")
+        if status_callback:
+            status_callback("🔄 Removing all images...")
+        
+        def remove_all():
+            try:
+                with docker_lock:
+                    images = client.images.list()
+                
+                removed_count = 0
+                for img in images:
+                    try:
+                        client.images.remove(img.id, force=True)
+                        removed_count += 1
+                    except Exception as e:
+                        logging.debug(f"Could not remove image {img.short_id}: {e}")
+                
+                logging.info(f"✅ Removed {removed_count} images")
+                if status_callback:
+                    status_callback(f"✅ Removed {removed_count} images")
+                if success_callback:
+                    success_callback()
+            except Exception as e:
+                logging.error(f"❌ Error removing all images: {e}")
+                if status_callback:
+                    status_callback(f"❌ Error removing images")
+        
+        from docker_monitor.utils.worker import run_in_thread
+        run_in_thread(remove_all, on_done=None, on_error=lambda e: logging.error(f"Remove all failed: {e}"), tk_root=None, block=True)
     
     @staticmethod
     def display_image_info(info_text, image_id, placeholder_label):

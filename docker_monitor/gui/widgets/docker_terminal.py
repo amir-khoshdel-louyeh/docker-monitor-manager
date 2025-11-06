@@ -1,7 +1,6 @@
 import tkinter as tk
 import queue
 import subprocess
-import threading
 import logging
 
 

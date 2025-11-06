@@ -7,8 +7,8 @@ Provides an interactive command `dmm-config` that can:
   and optionally switch the Docker AppArmor profile to complain/disabled to
   avoid permission denied issues.
 
-The script is conservative: it won't perform network installs unless the
-user confirms or uses --yes. It tries to handle macOS, Windows and several
+The script runs without additional CLI options and performs helper actions
+automatically when possible. It tries to handle macOS, Windows and several
 Linux distros.
 """
 from __future__ import annotations
@@ -32,17 +32,6 @@ def run(cmd: List[str], capture: bool = True) -> subprocess.CompletedProcess:
         raise
 
 
-def prompt_yes(question: str, auto_yes: bool) -> bool:
-    if auto_yes:
-        print(question + ' [auto-yes]')
-        return True
-    try:
-        resp = input(question + ' [y/N]: ').strip().lower()
-        return resp in ('y', 'yes')
-    except (EOFError, KeyboardInterrupt):
-        return False
-
-
 def is_command_available(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -59,7 +48,7 @@ def check_docker() -> bool:
     return False
 
 
-def install_docker_linux(auto_yes: bool) -> bool:
+def install_docker_linux() -> bool:
     # Try to detect package manager
     os_release = {}
     try:
@@ -79,9 +68,6 @@ def install_docker_linux(auto_yes: bool) -> bool:
     # Prefer distro packages for Debian/Ubuntu
     if 'ubuntu' in id_like or 'debian' in id_like:
         print('Attempting to install Docker via apt (docker.io).')
-        if not prompt_yes('Run: sudo apt-get update && sudo apt-get install -y docker.io ?', auto_yes):
-            print('Skipping apt-based install. You can install Docker manually or use the official script.')
-            return False
         cmds = [
             ['sudo', 'apt-get', 'update'],
             ['sudo', 'apt-get', 'install', '-y', 'docker.io'],
@@ -99,8 +85,7 @@ def install_docker_linux(auto_yes: bool) -> bool:
             cmds = [['sudo', 'pacman', '-S', '--noconfirm', 'docker']]
         else:
             print('Could not find a supported package manager. You can use the official install script from get.docker.com.')
-            if not prompt_yes('Run the official Docker install script (curl -fsSL https://get.docker.com | sudo sh)?', auto_yes):
-                return False
+            print('Running the official Docker install script (curl -fsSL https://get.docker.com | sudo sh).')
             cmds = [['sh', '-c', 'curl -fsSL https://get.docker.com | sudo sh']]
 
     for c in cmds:
@@ -114,13 +99,10 @@ def install_docker_linux(auto_yes: bool) -> bool:
     return check_docker()
 
 
-def install_docker_macos(auto_yes: bool) -> bool:
+def install_docker_macos() -> bool:
     # Prefer Homebrew if available
     if is_command_available('brew'):
         print('Homebrew detected. Installing Docker Desktop via brew cask.')
-        if not prompt_yes('Run: brew install --cask docker ?', auto_yes):
-            print('Skipping brew cask install. Please install Docker Desktop from https://www.docker.com/get-started')
-            return False
         proc = run(['brew', 'install', '--cask', 'docker'], capture=False)
         if proc.returncode != 0:
             print('brew cask install failed.')
@@ -131,20 +113,14 @@ def install_docker_macos(auto_yes: bool) -> bool:
         return False
 
 
-def install_docker_windows(auto_yes: bool) -> bool:
+def install_docker_windows() -> bool:
     # Try winget or choco
     if is_command_available('winget'):
         print('Attempting to install Docker Desktop via winget.')
-        if not prompt_yes('Run: winget install --id Docker.DockerDesktop -e ?', auto_yes):
-            print('Skipping winget install. Please install Docker Desktop from https://www.docker.com/get-started')
-            return False
         proc = run(['winget', 'install', '--id', 'Docker.DockerDesktop', '-e'], capture=False)
         return proc.returncode == 0 and check_docker()
     if is_command_available('choco'):
         print('Attempting to install Docker Desktop via choco.')
-        if not prompt_yes('Run: choco install docker-desktop -y ?', auto_yes):
-            print('Skipping choco install. Please install Docker Desktop from https://www.docker.com/get-started')
-            return False
         proc = run(['choco', 'install', 'docker-desktop', '-y'], capture=False)
         return proc.returncode == 0 and check_docker()
 
@@ -152,7 +128,7 @@ def install_docker_windows(auto_yes: bool) -> bool:
     return False
 
 
-def ensure_apparmor_utils_linux(auto_yes: bool) -> None:
+def ensure_apparmor_utils_linux() -> None:
     # Only meaningful on Linux
     if not is_command_available('aa-status'):
         print('AppArmor utilities (aa-status/aa-complain/aa-disable) not found.')
@@ -168,16 +144,16 @@ def ensure_apparmor_utils_linux(auto_yes: bool) -> None:
 
         if distro in ('ubuntu', 'debian'):
             print('On Ubuntu/Debian these tools are provided by package apparmor-utils.')
-            if prompt_yes('Run: sudo apt-get update && sudo apt-get install -y apparmor-utils ?', auto_yes):
-                rc = run(['sudo', 'apt-get', 'update'], capture=False)
-                if rc.returncode == 0:
-                    rc2 = run(['sudo', 'apt-get', 'install', '-y', 'apparmor-utils'], capture=False)
-                    if rc2.returncode == 0:
-                        print('apparmor-utils installed.')
-                    else:
-                        print('Failed to install apparmor-utils.')
+            print('Installing apparmor-utils via apt-get.')
+            rc = run(['sudo', 'apt-get', 'update'], capture=False)
+            if rc.returncode == 0:
+                rc2 = run(['sudo', 'apt-get', 'install', '-y', 'apparmor-utils'], capture=False)
+                if rc2.returncode == 0:
+                    print('apparmor-utils installed.')
                 else:
-                    print('apt-get update failed.')
+                    print('Failed to install apparmor-utils.')
+            else:
+                print('apt-get update failed.')
         else:
             print('Could not detect Ubuntu/Debian. Please install your distribution equivalent of apparmor-utils (aa-complain/aa-disable).')
     else:
@@ -187,10 +163,10 @@ def ensure_apparmor_utils_linux(auto_yes: bool) -> None:
     profile_path = '/etc/apparmor.d/docker'
     if os.path.exists(profile_path) and is_command_available('aa-complain'):
         print(f'Found AppArmor profile at {profile_path}')
-        if prompt_yes('Run: sudo aa-complain /etc/apparmor.d/docker (switch Docker profile to complain)?', auto_yes):
-            run(['sudo', 'aa-complain', profile_path], capture=False)
-        if prompt_yes('Run: sudo aa-disable /etc/apparmor.d/docker (disable Docker AppArmor profile)?', auto_yes):
-            run(['sudo', 'aa-disable', profile_path], capture=False)
+        print('Switching Docker AppArmor profile to complain mode.')
+        run(['sudo', 'aa-complain', profile_path], capture=False)
+        print('Disabling Docker AppArmor profile.')
+        run(['sudo', 'aa-disable', profile_path], capture=False)
     else:
         if not os.path.exists(profile_path):
             print('No AppArmor profile for Docker found at /etc/apparmor.d/docker. Skipping profile changes.')
@@ -201,9 +177,12 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
-    auto_yes = False
-    if '--yes' in argv or '-y' in argv:
-        auto_yes = True
+    if argv:
+        if argv[0] in ('-h', '--help'):
+            print('Usage: dmm-config')
+            return 0
+        print('Unexpected argument(s):', ' '.join(argv))
+        return 1
 
     print('dmm-config: docker-monitor-manager system configuration helper')
     system = platform.system().lower()
@@ -212,19 +191,19 @@ def main(argv=None):
     docker_ok = check_docker()
     if not docker_ok:
         if system == 'linux':
-            installed = install_docker_linux(auto_yes)
+            installed = install_docker_linux()
             if not installed:
                 print('\nDocker was not installed automatically. Please install Docker manually following https://docs.docker.com/get-docker/')
         elif system == 'darwin':
-            install_docker_macos(auto_yes)
+            install_docker_macos()
         elif system in ('windows', 'msys'):
-            install_docker_windows(auto_yes)
+            install_docker_windows()
         else:
             print('Unsupported platform for automatic Docker installation. Please install Docker manually.')
 
     # AppArmor is only relevant on Linux
     if system == 'linux':
-        ensure_apparmor_utils_linux(auto_yes)
+        ensure_apparmor_utils_linux()
 
     print('\nConfiguration finished. If you installed system packages, a reboot or relogin may be required.')
 

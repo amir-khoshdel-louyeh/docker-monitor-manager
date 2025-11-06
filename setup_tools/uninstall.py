@@ -257,8 +257,6 @@ def uninstall_package():
     """Uninstall the Python package"""
     print("\n🗑️  Uninstalling Python package...")
     
-    package_uninstalled = False
-    
     # Try to detect if installed with pipx
     try:
         result = subprocess.run(

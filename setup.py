@@ -78,6 +78,7 @@ setup(
             "dmm=docker_monitor.main:main",
             "dmm-config=docker_monitor.cli.config:main",
             "dmm-doctor=docker_monitor.cli.doctor:main",
+            "dmm-cleanup=docker_monitor.cli.cleanup:main",
             "dmm-test=docker_monitor.cli.test:main",
             "dmm-setup=setup_tools.post_install:main",
             "dmm-update=docker_monitor.cli.update:main",

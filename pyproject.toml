@@ -15,6 +15,7 @@ requires-python = ">=3.8"
 dependencies = [
     "docker>=6.0.0",
     "Pillow>=9.0.0",
+    "psutil>=5.9.0",
 ]
 keywords = ["docker", "monitoring", "containers", "gui", "desktop", "management"]
 classifiers = [
@@ -43,6 +44,7 @@ docker-monitor-manager = "docker_monitor.main:main"
 dmm = "docker_monitor.main:main"
 dmm-config = "docker_monitor.cli.config:main"
 dmm-doctor = "docker_monitor.cli.doctor:main"
+dmm-cleanup = "docker_monitor.cli.cleanup:main"
 dmm-test = "docker_monitor.cli.test:main"
 dmm-uninstall = "docker_monitor.cli.uninstall:main"
 dmm-setup = "setup_tools.post_install:main"

@@ -1,7 +1,6 @@
 import concurrent.futures
 import threading
 import logging
-from functools import partial
 
 # Shared ThreadPoolExecutor for I/O-bound tasks (Docker SDK calls)
 # Tuned default: 16 workers for typical desktop; adjustable if needed.

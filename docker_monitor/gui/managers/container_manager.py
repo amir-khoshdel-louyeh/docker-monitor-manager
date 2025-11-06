@@ -4,7 +4,6 @@ Handles all container-related operations including listing, actions, and informa
 """
 
 import logging
-import threading
 import tkinter as tk
 from tkinter import messagebox
 from docker_monitor.utils.docker_utils import (
@@ -13,6 +12,8 @@ from docker_monitor.utils.docker_utils import (
     get_container_stats,
     docker_cleanup
 )
+from docker_monitor.utils.worker import run_in_thread
+from docker_monitor.utils.docker_controller import get_docker_controller
 
 
 class ContainerManager:
@@ -34,22 +35,38 @@ class ContainerManager:
         item = tree.item(selected_items[0])
         container_name = item['values'][1]
         logging.info(f"User requested '{action}' on container '{container_name}'.")
-
-        with docker_lock:
+        
+        # Get controller instance for notifications
+        controller = get_docker_controller()
+        def _perform_action():
+            success = False
+            error_msg = None
             try:
-                container = client.containers.get(container_name)
-                if action == 'remove':
-                    # First stop, then forcefully remove to avoid conflicts.
-                    container.stop()
-                    container.remove(force=True)
-                    # Schedule a cleanup to reclaim resources after removal
-                    from docker_monitor.utils.worker import run_in_thread
-                    from docker_monitor.utils.docker_utils import docker_cleanup
-                    run_in_thread(docker_cleanup, on_done=None, on_error=lambda e: logging.error(f"Cleanup failed: {e}"), tk_root=None, block=False)
-                elif hasattr(container, action):
-                    getattr(container, action)()
-            except Exception as e:
-                logging.error(f"Error during '{action}' on container '{container_name}': {e}")
+                with docker_lock:
+                    container = client.containers.get(container_name)
+                    if action == 'remove':
+                        container.stop()
+                        container.remove(force=True)
+                        docker_cleanup()
+                    elif hasattr(container, action):
+                        getattr(container, action)()
+                    success = True
+            except Exception as exc:
+                error_msg = str(exc)
+                logging.error(f"Error during '{action}' on container '{container_name}': {exc}")
+
+            controller.notify_container_action(action, container_name, success, error_msg)
+
+            if success:
+                stats_list = ContainerManager.fetch_all_stats()
+                controller.update_containers(stats_list)
+
+        run_in_thread(
+            _perform_action,
+            on_error=lambda exc: logging.error(f"Container action worker failed: {exc}"),
+            tk_root=None,
+            block=False,
+        )
 
     @staticmethod
     def run_global_action(action):
@@ -59,28 +76,39 @@ class ContainerManager:
             action: Action to perform (stop, pause, unpause, restart, remove)
         """
         logging.info(f"User requested '{action}' on ALL containers.")
-        with docker_lock:
+        controller = get_docker_controller()
+
+        def _perform_global_action():
             try:
-                containers = client.containers.list(all=True)
-                for container in containers:
-                    if action == 'pause' and container.status == 'running': 
-                        container.pause()
-                    elif action == 'unpause' and container.status == 'paused': 
-                        container.unpause()
-                    elif action == 'stop' and container.status == 'running': 
-                        container.stop()
-                    elif action == 'restart': 
-                        container.restart()
-                    elif action == 'remove':
-                        # Forcefully remove each container after stopping.
-                        container.stop()
-                        container.remove(force=True)
-            except Exception as e:
-                logging.error(f"Error during global '{action}': {e}")
-            finally:
+                with docker_lock:
+                    containers = client.containers.list(all=True)
+
+                    action_handlers = {
+                        'pause': lambda c: c.pause() if c.status == 'running' else None,
+                        'unpause': lambda c: c.unpause() if c.status == 'paused' else None,
+                        'stop': lambda c: c.stop() if c.status == 'running' else None,
+                        'restart': lambda c: c.restart(),
+                        'remove': lambda c: (c.stop(), c.remove(force=True)),
+                    }
+
+                    handler = action_handlers.get(action)
+                    if handler:
+                        list(map(lambda c: handler(c) if handler else None, containers))
+
                 if action in ['stop', 'remove']:
-                    from docker_monitor.utils.worker import run_in_thread
-                    run_in_thread(docker_cleanup, on_done=None, on_error=lambda e: logging.error(f"Cleanup failed: {e}"), tk_root=None, block=False)
+                    docker_cleanup()
+
+                stats_list = ContainerManager.fetch_all_stats()
+                controller.update_containers(stats_list)
+            except Exception as exc:
+                logging.error(f"Error during global '{action}': {exc}")
+
+        run_in_thread(
+            _perform_global_action,
+            on_error=lambda exc: logging.error(f"Global container action worker failed: {exc}"),
+            tk_root=None,
+            block=False,
+        )
 
     @staticmethod
     def stop_all_containers(status_bar_callback=None, log_callback=None):
@@ -104,16 +132,21 @@ class ContainerManager:
         def stop_all():
             try:
                 containers = client.containers.list()
-                stopped = 0
-                for container in containers:
+                
+                # Define stop function to avoid repeated try-catch in loop
+                def try_stop(container):
                     try:
                         container.stop(timeout=10)
-                        stopped += 1
                         if log_callback:
                             log_callback(lambda name=container.name: logging.info(f"⏹️  Stopped: {name}"))
+                        return True
                     except Exception as e:
                         if log_callback:
                             log_callback(lambda name=container.name, err=e: logging.warning(f"⚠️  Failed to stop {name}: {err}"))
+                        return False
+                
+                # Use list comprehension and sum for counting - faster than loop
+                stopped = sum(1 for c in containers if try_stop(c))
                 
                 if log_callback:
                     log_callback(lambda count=stopped: logging.info(f"✅ Stopped {count} containers"))
@@ -124,7 +157,6 @@ class ContainerManager:
                 if status_bar_callback:
                     status_bar_callback("❌ Error stopping containers")
         # Run the stop_all function in the shared worker so the UI/main thread is not blocked.
-        from docker_monitor.utils.worker import run_in_thread
         run_in_thread(stop_all, on_done=None, on_error=lambda e: logging.error(f"stop_all failed: {e}"), tk_root=None, block=False)
 
     @staticmethod
@@ -154,19 +186,24 @@ class ContainerManager:
         current_names = {item['name'] for item in stats_list}
         tree_items = tree.get_children()
 
-        for child in tree_items:
-            # child is the iid which we set to container name
-            if child not in current_names:
-                tree.delete(child)
+        # Batch delete using filter - more efficient than loop with conditionals
+        to_delete = [child for child in tree_items if child not in current_names]
+        list(map(tree.delete, to_delete))
 
-        for item in stats_list:
-            # Use short ID (first 12 chars) for display
-            short_id = item['id'][:12] if len(item['id']) > 12 else item['id']
-            values = (short_id, item['name'], item['status'], item['cpu'], item['ram'])
-            if tree.exists(item['name']):
-                tree.item(item['name'], values=values)
+        # Batch update/insert using comprehension - prepare all data first
+        updates = [
+            (item['name'], 
+             (item['id'][:12] if len(item['id']) > 12 else item['id'], 
+              item['name'], item['status'], item['cpu'], item['ram']))
+            for item in stats_list
+        ]
+        
+        # Apply updates/inserts (still need individual calls but data is prepared)
+        for name, values in updates:
+            if tree.exists(name):
+                tree.item(name, values=values)
             else:
-                tree.insert('', tk.END, iid=item['name'], values=values)
+                tree.insert('', tk.END, iid=name, values=values)
         
         ContainerManager.reapply_row_tags(tree)
         
@@ -183,8 +220,10 @@ class ContainerManager:
         Args:
             tree: Treeview widget
         """
-        for i, iid in enumerate(tree.get_children()):
-            tree.item(iid, tags=('evenrow' if i % 2 == 0 else 'oddrow',))
+        # Use map instead of explicit loop - faster for bulk operations
+        children = tree.get_children()
+        list(map(lambda i_iid: tree.item(i_iid[1], tags=('evenrow' if i_iid[0] % 2 == 0 else 'oddrow',)), 
+                 enumerate(children)))
 
     @staticmethod
     def filter_containers(all_containers, search_text):
@@ -218,7 +257,8 @@ class ContainerManager:
         with docker_lock:
             try:
                 all_containers = client.containers.list(all=True)
-                return [get_container_stats(c) for c in all_containers]
+                # Filter out None results (removed containers)
+                return [s for s in (get_container_stats(c) for c in all_containers) if s is not None]
             except Exception as e:
                 logging.error(f"Error fetching container stats: {e}")
                 return []
@@ -377,7 +417,6 @@ class ContainerManager:
         if selected_items:
             item = tree.item(selected_items[0])
             container_id = item['values'][0]  # ID is the first column
-            container_name = item['values'][1]  # Name is the second column
             clipboard_clear()
             clipboard_append(container_id)
             update_func()  # Required for clipboard to work

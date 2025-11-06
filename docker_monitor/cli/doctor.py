@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-dmm-doctor: Docker Monitor Manager system health checker and auto-fixer
+dmm-doctor: Docker Monitor Manager system health checker
 
-This tool diagnoses common issues and automatically fixes them:
+This tool diagnoses common issues and suggests ways to fix them:
 - Docker installation and service status
 - Docker permissions
 - AppArmor/SELinux conflicts
 - Network connectivity
 - Container runtime issues
 - System resources
+- For resource cleanup tasks, run `dmm-cleanup`
 """
 from __future__ import annotations
 
@@ -153,61 +154,35 @@ def check_network_connectivity() -> Tuple[bool, str]:
     return False, "Cannot reach Docker Hub"
 
 
-def fix_docker_permissions(auto_fix: bool) -> bool:
-    """Fix Docker permissions by adding user to docker group"""
+
+
+def fix_docker_permissions() -> None:
+    """Suggest steps to fix Docker permissions issues"""
     system = platform.system().lower()
     if system != 'linux':
-        print_fix("Permission fix only applicable on Linux")
-        return False
-    
+        print_fix("Permission guidance only applies on Linux")
+        return
+
     username = os.getenv('USER')
     if not username:
-        print_fix("Could not determine username")
-        return False
-    
-    print_fix(f"Adding user '{username}' to docker group")
-    
-    if auto_fix:
-        result = run_command(['sudo', 'usermod', '-aG', 'docker', username], capture=False)
-        if result.returncode == 0:
-            print(f"  {Colors.GREEN}✓{Colors.ENDC} User added to docker group")
-            print(f"  {Colors.YELLOW}⚠{Colors.ENDC}  You need to log out and back in for changes to take effect")
-            return True
-        else:
-            print(f"  {Colors.RED}✗{Colors.ENDC} Failed to add user to docker group")
-            return False
-    else:
-        print(f"  Run: sudo usermod -aG docker {username}")
-        print(f"  Then log out and back in")
-        return False
+        print_fix("Could not determine username; run 'whoami' to verify")
+        return
+
+    print_fix(f"Run: sudo usermod -aG docker {username}")
+    print_fix("Then log out and back in for the change to take effect")
 
 
-def fix_docker_service(auto_fix: bool) -> bool:
-    """Start Docker service"""
+def fix_docker_service() -> None:
+    """Suggest steps to start Docker service"""
     system = platform.system().lower()
-    
+
     if system == 'linux':
-        print_fix("Starting Docker service")
-        if auto_fix:
-            result = run_command(['sudo', 'systemctl', 'start', 'docker'], capture=False)
-            if result.returncode == 0:
-                # Also enable it
-                run_command(['sudo', 'systemctl', 'enable', 'docker'], capture=False)
-                print(f"  {Colors.GREEN}✓{Colors.ENDC} Docker service started and enabled")
-                return True
-            else:
-                print(f"  {Colors.RED}✗{Colors.ENDC} Failed to start Docker service")
-                return False
-        else:
-            print("  Run: sudo systemctl start docker")
-            print("  And: sudo systemctl enable docker")
-            return False
+        print_fix("Run: sudo systemctl start docker")
+        print_fix("Then run: sudo systemctl enable docker")
     elif system == 'darwin':
         print_fix("Please start Docker Desktop application manually")
-        return False
     else:
         print_fix("Please start Docker Desktop manually")
-        return False
 
 
 def diagnose_docker_daemon_issues() -> List[str]:
@@ -242,20 +217,20 @@ def main(argv=None):
     """Main entry point for dmm-doctor"""
     if argv is None:
         argv = sys.argv[1:]
-    
-    auto_fix = '--fix' in argv or '-f' in argv
-    verbose = '--verbose' in argv or '-v' in argv
+
+    if argv:
+        if argv[0] in ('-h', '--help'):
+            print('Usage: dmm-doctor')
+            return 0
+        print('Unexpected argument(s):', ' '.join(argv))
+        return 1
     
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*60}{Colors.ENDC}")
     print(f"{Colors.BOLD}{Colors.HEADER}🏥 Docker Monitor Manager - System Doctor{Colors.ENDC}")
     print(f"{Colors.BOLD}{Colors.HEADER}{'='*60}{Colors.ENDC}\n")
     
-    if auto_fix:
-        print(f"{Colors.YELLOW}🔧 Auto-fix mode enabled{Colors.ENDC}\n")
-    
     # Track issues
     issues_found = 0
-    issues_fixed = 0
     
     # Check 1: Docker Installation
     print_header("1. Docker Installation")
@@ -272,8 +247,7 @@ def main(argv=None):
     print_check("Docker service", status, message)
     if not status:
         issues_found += 1
-        if fix_docker_service(auto_fix):
-            issues_fixed += 1
+        fix_docker_service()
     
     # Check 3: Docker Daemon
     print_header("3. Docker Daemon")
@@ -294,8 +268,7 @@ def main(argv=None):
     print_check("Docker permissions", status, message)
     if not status and 'permission denied' in message.lower():
         issues_found += 1
-        if fix_docker_permissions(auto_fix):
-            issues_fixed += 1
+        fix_docker_permissions()
     
     # Check 5: Docker Socket
     print_header("5. Docker Socket")
@@ -326,17 +299,8 @@ def main(argv=None):
         return 0
     else:
         print(f"{Colors.YELLOW}⚠ Found {issues_found} issue(s){Colors.ENDC}")
-        if auto_fix and issues_fixed > 0:
-            print(f"{Colors.GREEN}✓ Fixed {issues_fixed} issue(s){Colors.ENDC}")
-        
-        if not auto_fix:
-            print(f"\n{Colors.CYAN}Tip: Run with --fix to automatically fix issues:{Colors.ENDC}")
-            print(f"  dmm-doctor --fix\n")
-        else:
-            remaining = issues_found - issues_fixed
-            if remaining > 0:
-                print(f"{Colors.YELLOW}⚠ {remaining} issue(s) require manual intervention{Colors.ENDC}\n")
-        
+        print(f"{Colors.CYAN}Review the suggestions above to resolve outstanding problems.{Colors.ENDC}\n")
+
         return 1
 
 

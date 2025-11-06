@@ -57,8 +57,11 @@ class CopyTooltip:
             try:
                 # Quick fade out
                 self.parent.after(100, self._destroy)
-            except:
-                pass
+            except (tk.TclError, RuntimeError) as e:
+                # Widget may have been destroyed or Tk not running
+                import logging
+                logging.debug(f"Tooltip fade out error: {e}")
+                self.tooltip = None
     
     def _destroy(self):
         """Destroy the tooltip."""
@@ -66,5 +69,8 @@ class CopyTooltip:
             try:
                 self.tooltip.destroy()
                 self.tooltip = None
-            except:
-                pass
+            except (tk.TclError, RuntimeError) as e:
+                # Widget may have been destroyed already
+                import logging
+                logging.debug(f"Tooltip destroy error: {e}")
+                self.tooltip = None

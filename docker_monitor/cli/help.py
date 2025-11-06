@@ -7,7 +7,6 @@ This tool provides comprehensive help and usage information for all dmm commands
 from __future__ import annotations
 
 import sys
-from typing import Optional
 
 
 class Colors:
@@ -68,6 +67,7 @@ def show_main_help():
     print_command("dmm-config", "Configure application settings and preferences")
     print_command("dmm-setup", "Run post-installation setup (desktop entry & icons)")
     print_command("dmm-update", "Update to the latest version from PyPI")
+    print_command("dmm-cleanup", "Prune unused Docker resources and free memory")
     print_command("dmm-uninstall", "Uninstall Docker Monitor Manager from system")
     
     print_subheader("🩺 Diagnostic Commands")
@@ -120,7 +120,7 @@ def show_command_help(command: str):
         'config': {
             'title': 'dmm-config',
             'description': 'Configure Docker Monitor Manager settings and preferences.',
-            'usage': 'dmm-config [options]',
+        'usage': 'dmm-config',
             'details': [
                 'Manage application configuration including:',
                 '  • Docker connection settings',
@@ -130,16 +130,15 @@ def show_command_help(command: str):
                 '  • Default behaviors',
             ],
             'examples': [
-                ('dmm-config', 'Open configuration manager'),
-                ('dmm-config --reset', 'Reset to default settings'),
+            ('dmm-config', 'Open configuration manager'),
             ]
         },
         'doctor': {
             'title': 'dmm-doctor',
-            'description': 'System health checker and auto-fixer for common Docker issues.',
-            'usage': 'dmm-doctor [options]',
+        'description': 'System health checker that guides you through fixing common Docker issues.',
+            'usage': 'dmm-doctor',
             'details': [
-                'Diagnoses and fixes common problems:',
+                'Diagnoses common problems, suggests fixes, and cleans up resources:',
                 '  • Docker installation and service status',
                 '  • Docker daemon connectivity',
                 '  • User permissions (docker group membership)',
@@ -147,12 +146,10 @@ def show_command_help(command: str):
                 '  • Network connectivity issues',
                 '  • Container runtime problems',
                 '  • System resource availability',
-                '',
-                'The doctor can automatically fix many issues it finds.',
+                '  • Orphaned container shims that still consume memory',
             ],
             'examples': [
                 ('dmm-doctor', 'Run full system diagnostic'),
-                ('dmm-doctor --fix', 'Auto-fix detected issues'),
             ]
         },
         'setup': {
@@ -176,20 +173,33 @@ def show_command_help(command: str):
         'update': {
             'title': 'dmm-update',
             'description': 'Update Docker Monitor Manager to the latest version.',
-            'usage': 'dmm-update [options]',
+            'usage': 'dmm-update',
             'details': [
                 'Updates the application to the latest version from PyPI:',
                 '  • Checks current installed version',
                 '  • Downloads and installs the latest version',
                 '  • Runs post-installation setup automatically',
                 '  • Preserves your configuration and settings',
-                '',
-                'Options:',
-                '  --force, -f    Force reinstall even if already latest version',
             ],
             'examples': [
                 ('dmm-update', 'Update to latest version'),
-                ('dmm-update --force', 'Force reinstall'),
+            ]
+        },
+        'cleanup': {
+            'title': 'dmm-cleanup',
+            'description': 'Prune unused Docker resources and reclaim memory.',
+            'usage': 'dmm-cleanup',
+            'details': [
+                'Performs maintenance tasks to keep Docker tidy:',
+                '  • Removes stopped containers (docker container prune)',
+                '  • Removes dangling/unused images',
+                '  • Removes unused networks and volumes',
+                '  • Terminates orphaned container shim processes to free memory',
+                '',
+                'Run with sudo if you encounter permission errors.',
+            ],
+            'examples': [
+                ('dmm-cleanup', 'Run all cleanup tasks'),
             ]
         },
         'uninstall': {
@@ -211,7 +221,7 @@ def show_command_help(command: str):
         'test': {
             'title': 'dmm-test',
             'description': 'Run application tests and verify installation.',
-            'usage': 'dmm-test [options]',
+        'usage': 'dmm-test [cleanup|status]',
             'details': [
                 'Verifies the installation and runs tests:',
                 '  • Checks if all dependencies are installed',
@@ -221,7 +231,8 @@ def show_command_help(command: str):
             ],
             'examples': [
                 ('dmm-test', 'Run all tests'),
-                ('dmm-test --verbose', 'Run with detailed output'),
+            ('dmm-test cleanup', 'Remove test containers'),
+            ('dmm-test status', 'Show status of test containers'),
             ]
         },
         'help': {

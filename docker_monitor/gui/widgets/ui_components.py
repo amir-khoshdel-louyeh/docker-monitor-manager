@@ -11,6 +11,13 @@ import logging
 class UIComponents:
     """Helper class containing UI component creation and styling methods."""
     
+    # Centralized button styling constants
+    BUTTON_FONT = ('Segoe UI', 9, 'bold')
+    BUTTON_PADX = 8
+    BUTTON_PADY = 8
+    BUTTON_HOVER_COLOR = '#5dade2'
+    BUTTON_MIN_WIDTH = 18  # Minimum width in characters for uniform button sizing
+    
     @staticmethod
     def setup_styles(app_instance):
         """Configures the visual style of the application."""
@@ -83,17 +90,12 @@ class UIComponents:
             logging.warning(f"Could not set custom tab layout: {e}")
 
     @staticmethod
-    def create_control_button(parent, text, bg_color, command, fg_color='white', width=15):
-        """Creates a styled control button.
-        
-        Args:
-            parent: Parent widget
-            text: Button text
-            bg_color: Background color
-            command: Command to execute on click
-            fg_color: Foreground (text) color
-            width: Button width in characters (default: 15)
-            
+    def create_control_button(parent, text, bg_color, command, fg_color='white'):
+        """Creates a styled control button with uniform sizing across tabs.
+
+        All control buttons have the same minimum width to ensure visual
+        consistency regardless of text length.
+
         Returns:
             tk.Button: The created button
         """
@@ -102,13 +104,13 @@ class UIComponents:
             text=text,
             bg=bg_color,
             fg=fg_color,
-            font=('Segoe UI', 9, 'bold'),
+            font=UIComponents.BUTTON_FONT,
             relief='flat',
             cursor='hand2',
             command=command,
-            padx=8,
-            pady=8,
-            width=width,
+            width=UIComponents.BUTTON_MIN_WIDTH,
+            padx=UIComponents.BUTTON_PADX,
+            pady=UIComponents.BUTTON_PADY,
             activebackground=bg_color,
             activeforeground=fg_color,
             bd=0,
@@ -116,7 +118,7 @@ class UIComponents:
         )
         
         def on_enter(e):
-            btn['bg'] = '#5dade2'
+            btn['bg'] = UIComponents.BUTTON_HOVER_COLOR
         def on_leave(e):
             btn['bg'] = bg_color
         

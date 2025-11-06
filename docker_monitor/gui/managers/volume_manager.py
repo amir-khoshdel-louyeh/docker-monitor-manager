@@ -5,11 +5,12 @@ Handles all Docker volume-related operations.
 
 import json
 import logging
-import threading
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, simpledialog
 
 from docker_monitor.utils.docker_utils import client, docker_lock
+from docker_monitor.utils.docker_controller import get_docker_controller
+from docker_monitor.utils.worker import run_in_thread
 
 
 class VolumeManager:
@@ -44,21 +45,31 @@ class VolumeManager:
         selected_iid = current_selection[0] if current_selection else None
 
         current_names = {v['Name'] for v in vol_list}
-        for child in list(volumes_tree.get_children()):
-            if volumes_tree.item(child)['values'][0] not in current_names:
-                volumes_tree.delete(child)
+        
+        # Batch delete using filter and map
+        to_delete = [child for child in volumes_tree.get_children() 
+                    if volumes_tree.item(child)['values'][0] not in current_names]
+        list(map(volumes_tree.delete, to_delete))
 
-        for v in vol_list:
-            labels = ','.join([f"{k}={v}" for k, v in (v.get('Labels') or {}).items()]) if v.get('Labels') else ''
-            values = (v['Name'], v.get('Driver', ''), v.get('Mountpoint', ''), labels)
-            iid = v['Name']
+        # Prepare volume data in batch
+        volume_updates = [
+            (v['Name'],
+             (v['Name'], v.get('Driver', ''), v.get('Mountpoint', ''),
+              ','.join([f"{k}={v}" for k, v in (v.get('Labels') or {}).items()]) if v.get('Labels') else ''))
+            for v in vol_list
+        ]
+        
+        # Apply updates/inserts
+        for iid, values in volume_updates:
             if volumes_tree.exists(iid):
                 volumes_tree.item(iid, values=values)
             else:
                 volumes_tree.insert('', tk.END, iid=iid, values=values)
 
-        for i, iid in enumerate(volumes_tree.get_children()):
-            volumes_tree.item(iid, tags=('evenrow' if i % 2 == 0 else 'oddrow',))
+        # Apply tags using map - faster than loop
+        children = volumes_tree.get_children()
+        list(map(lambda i_iid: volumes_tree.item(i_iid[1], tags=('evenrow' if i_iid[0] % 2 == 0 else 'oddrow',)), 
+                 enumerate(children)))
         
         # Restore selection if it still exists
         if selected_iid and volumes_tree.exists(selected_iid):
@@ -89,21 +100,102 @@ class VolumeManager:
         )
     
     @staticmethod
-    def remove_volume(name, update_callback):
+    def create_volume(name_callback, driver_callback, success_callback, tk_root=None):
+        """Create a new Docker volume.
+        
+        Args:
+            name_callback: Function to get volume name from user
+            driver_callback: Function to get driver from user
+            success_callback: Function to call on success
+        """
+        name = name_callback()
+        if not name:
+            return
+        
+        driver = driver_callback()
+        if not driver:
+            driver = 'local'  # Default driver
+        
+        controller = get_docker_controller()
+        def _create():
+            success = False
+            error_msg = None
+            try:
+                with docker_lock:
+                    client.volumes.create(name=name, driver=driver)
+                logging.info(f'✅ Created volume {name} with driver {driver}')
+                success = True
+            except Exception as exc:
+                error_msg = str(exc)
+                logging.error(f'❌ Failed to create volume {name}: {exc}')
+
+            controller.notify_volume_action('create', name, success, error_msg)
+
+            if success:
+                vol_list = VolumeManager.fetch_volumes()
+                controller.update_volumes(vol_list)
+
+            return success, error_msg
+
+        def _after_create(result):
+            success, error_msg = result
+            if success:
+                if success_callback:
+                    success_callback()
+            else:
+                messagebox.showerror('Error', f'Failed to create volume: {error_msg}')
+
+        run_in_thread(
+            _create,
+            on_done=_after_create,
+            on_error=lambda exc: logging.error(f'Volume creation worker failed: {exc}'),
+            tk_root=tk_root,
+            block=False,
+        )
+    
+    @staticmethod
+    def remove_volume(name, update_callback, tk_root=None):
         """Remove a volume."""
         confirm = messagebox.askyesno('Confirm Remove', f'Remove volume {name}?')
         if not confirm:
             return
         
-        try:
-            with docker_lock:
-                vol = client.volumes.get(name)
-                vol.remove()
-            logging.info(f'✅ Removed volume {name}')
-            update_callback()
-        except Exception as e:
-            logging.error(f'❌ Failed to remove volume {name}: {e}')
-            messagebox.showerror('Error', f'Failed to remove volume: {str(e)}')
+        controller = get_docker_controller()
+        def _remove():
+            success = False
+            error_msg = None
+            try:
+                with docker_lock:
+                    vol = client.volumes.get(name)
+                    vol.remove()
+                logging.info(f'✅ Removed volume {name}')
+                success = True
+            except Exception as exc:
+                error_msg = str(exc)
+                logging.error(f'❌ Failed to remove volume {name}: {exc}')
+
+            controller.notify_volume_action('remove', name, success, error_msg)
+
+            if success:
+                vol_list = VolumeManager.fetch_volumes()
+                controller.update_volumes(vol_list)
+
+            return success, error_msg
+
+        def _after_remove(result):
+            success, error_msg = result
+            if success:
+                update_callback()
+            else:
+                messagebox.showerror('Error', f'Failed to remove volume: {error_msg}')
+
+        run_in_thread(
+            _remove,
+            on_done=_after_remove,
+            on_error=lambda exc: logging.error(f'Volume removal worker failed: {exc}'),
+            tk_root=tk_root,
+            block=False,
+        )
     
     @staticmethod
     def prune_volumes(refresh_callback, status_bar):
@@ -127,10 +219,10 @@ class VolumeManager:
                 status_bar.after(0, status_bar.config, {"text": f"✅ Removed {count} volumes"})
                 status_bar.after(0, refresh_callback)
             except Exception as e:
-                status_bar.after(0, lambda: logging.error(f"❌ Error: {e}"))
+                status_bar.after(0, lambda err=e: logging.error(f"❌ Error: {err}"))
         
-            from docker_monitor.utils.worker import run_in_thread
-            run_in_thread(prune, on_done=None, on_error=lambda e: status_bar.after(0, lambda: logging.error(f"Prune failed: {e}")), tk_root=None, block=True)
+        from docker_monitor.utils.worker import run_in_thread
+        run_in_thread(prune, on_done=None, on_error=lambda e: status_bar.after(0, lambda: logging.error(f"Prune failed: {e}")), tk_root=None, block=True)
     
     @staticmethod
     def show_volume_inspect_modal(parent, name):
@@ -172,6 +264,13 @@ class VolumeManager:
             # This will be handled separately via prune_volumes
             return
         
+        if action == 'create':
+            # Create doesn't need a selection
+            name_callback = lambda: simpledialog.askstring("Create Volume", "Enter volume name:")
+            driver_callback = lambda: simpledialog.askstring("Create Volume", "Driver (local/nfs/etc):", initialvalue='local')
+            VolumeManager.create_volume(name_callback, driver_callback, update_callback, tk_root=parent)
+            return
+        
         sel = volumes_tree.selection()
         if not sel:
             logging.warning('⚠️ No volume selected for action.')
@@ -181,7 +280,7 @@ class VolumeManager:
         name = volumes_tree.item(sel[0])['values'][0]
         
         if action == 'remove':
-            VolumeManager.remove_volume(name, update_callback)
+            VolumeManager.remove_volume(name, update_callback, tk_root=parent)
         elif action == 'inspect':
             VolumeManager.show_volume_inspect_modal(parent, name)
         else:
