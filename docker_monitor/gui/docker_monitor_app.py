@@ -95,9 +95,6 @@ class DockerMonitorApp(tk.Tk, Observer):
         # Initialize copy tooltip for professional hints
         self.copy_tooltip = CopyTooltip(self)
         
-        # Initialize default resource limits
-        self.default_mem_limit = '512m'
-        self.default_cpu_limit = '1.0'
 
         # Setup UI styles using UIComponents
         UIComponents.setup_styles(self)
@@ -746,6 +743,48 @@ class DockerMonitorApp(tk.Tk, Observer):
         config_btn.bind('<Leave>', lambda e: config_btn.config(bg="#6c757d"))
 
 
+    def _on_log_level_change(self):
+        """Update Python logging level to match the settings combobox.
+
+        This sets the root logger level and adjusts existing handlers so
+        log output reflects the new selection immediately.
+        """
+        try:
+            import logging
+            level_name = (self.log_level_var.get() or 'INFO').upper()
+            level = getattr(logging, level_name, logging.INFO)
+            root = logging.getLogger()
+            root.setLevel(level)
+            # Update existing handlers so they reflect the new level
+            for h in list(root.handlers):
+                try:
+                    h.setLevel(level)
+                except Exception:
+                    # Some handlers may not accept setLevel; ignore
+                    pass
+
+            # Ensure other named loggers inherit the root level by clearing their explicit levels
+            try:
+                for name, logger in logging.root.manager.loggerDict.items():
+                    try:
+                        if isinstance(logger, logging.Logger):
+                            logger.setLevel(logging.NOTSET)
+                    except Exception:
+                        pass
+            except Exception:
+                # In case logging internals are unusual, ignore and continue
+                pass
+
+            root.info(f"Logging level set to {level_name}")
+        except Exception as e:
+            # Best-effort reporting
+            try:
+                import logging
+                logging.error(f"Failed to set log level: {e}")
+            except Exception:
+                pass
+
+
     def create_container_widgets(self, parent):
         # Use a Notebook to provide Containers and Network tabs
         notebook = ttk.Notebook(parent)
@@ -1315,6 +1354,8 @@ class DockerMonitorApp(tk.Tk, Observer):
                                 values=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                                 width=10, state='readonly')
         log_combo.pack(side=tk.LEFT, padx=8)
+        # When the user changes the combobox, update the application's logging level
+        self.log_level_var.trace('w', lambda *args: self._on_log_level_change())
         
         # Row 4: Theme toggle
         theme_row = tk.Frame(control_inner, bg='#2a3a4a')
@@ -1360,42 +1401,7 @@ class DockerMonitorApp(tk.Tk, Observer):
             else:
                 btn.pack(side=tk.LEFT, padx=(0, 5) if i < len(cleanup_btns)-1 else 0, expand=True, fill=tk.X)
 
-        # Resource Limits Card
-        limits_card = tk.Frame(left_column, bg='#2a3a4a', relief='flat')
-        limits_card.pack(fill=tk.X, pady=(0, 8))
-        
-        limits_inner = tk.Frame(limits_card, bg='#2a3a4a')
-        limits_inner.pack(fill=tk.X, padx=10, pady=10)
-        
-        limits_label = tk.Label(limits_inner, text="📊 Default Resource Limits", 
-                               font=('Segoe UI', 11, 'bold'), fg='#4ecdc4', bg='#2a3a4a')
-        limits_label.pack(anchor='w', pady=(0, 5))
-        
-        # Memory limit
-        mem_row = tk.Frame(limits_inner, bg='#2a3a4a')
-        mem_row.pack(fill=tk.X, pady=3)
-        tk.Label(mem_row, text='💾 Memory limit:', bg='#2a3a4a', fg='#cccccc',
-                font=('Segoe UI', 9), width=15, anchor='w').pack(side=tk.LEFT)
-        self.mem_limit_var = tk.StringVar(value='512m')
-        mem_entry = tk.Entry(mem_row, textvariable=self.mem_limit_var, width=12,
-                            bg='#ffffff', fg='#000000', font=('Segoe UI', 9))
-        mem_entry.pack(side=tk.LEFT, padx=5)
-        
-        # CPU limit
-        cpu_row = tk.Frame(limits_inner, bg='#2a3a4a')
-        cpu_row.pack(fill=tk.X, pady=3)
-        tk.Label(cpu_row, text='⚡ CPU limit:', bg='#2a3a4a', fg='#cccccc',
-                font=('Segoe UI', 9), width=15, anchor='w').pack(side=tk.LEFT)
-        self.cpu_limit_var = tk.StringVar(value='1.0')
-        cpu_entry = tk.Entry(cpu_row, textvariable=self.cpu_limit_var, width=12,
-                            bg='#ffffff', fg='#000000', font=('Segoe UI', 9))
-        cpu_entry.pack(side=tk.LEFT, padx=5)
-        
-        apply_limits_btn = tk.Button(limits_inner, text='✓ Apply Changes', 
-                                     bg='#4ecdc4', fg='white', font=('Segoe UI', 9, 'bold'),
-                                     relief='flat', cursor='hand2', padx=15, pady=6,
-                                     command=self.apply_default_limits)
-        apply_limits_btn.pack(pady=(8, 0))
+    # (Default Resource Limits UI removed)
 
         # Export System Report Card
         export_card = tk.Frame(left_column, bg='#2a3a4a', relief='flat')
@@ -1819,42 +1825,7 @@ class DockerMonitorApp(tk.Tk, Observer):
             auto_refresh_enabled=hasattr(self, 'auto_refresh_var') and self.auto_refresh_var.get(),
             refresh_interval=self.refresh_interval_var.get() if hasattr(self, 'refresh_interval_var') else None
         )
-    
-    def apply_default_limits(self):
-        """Apply default resource limits."""
-        try:
-            mem_limit = self.mem_limit_var.get().strip()
-            cpu_limit = self.cpu_limit_var.get().strip()
-            
-            # Validate memory limit format (e.g., 512m, 1g, 2048m)
-            if not mem_limit or not any(mem_limit.endswith(suffix) for suffix in ['m', 'M', 'g', 'G', 'k', 'K']):
-                messagebox.showerror('Error', 'Invalid memory limit format!\n\nExamples: 512m, 1g, 2048m')
-                return
-            
-            # Validate CPU limit (should be a number)
-            try:
-                cpu_val = float(cpu_limit)
-                if cpu_val <= 0:
-                    raise ValueError()
-            except ValueError:
-                messagebox.showerror('Error', 'Invalid CPU limit!\n\nMust be a positive number (e.g., 1.0, 2.5)')
-                return
-            
-            # Store the values as instance variables
-            self.default_mem_limit = mem_limit
-            self.default_cpu_limit = cpu_limit
-            
-            logging.info(f"✓ Default limits set: Memory={mem_limit}, CPU={cpu_limit}")
-            messagebox.showinfo('Success', 
-                f'Default resource limits applied:\n\n'
-                f'💾 Memory: {mem_limit}\n'
-                f'⚡ CPU: {cpu_limit}\n\n'
-                f'These limits will be used when creating new containers.')
-            self.status_bar.config(text=f"✓ Default limits: Mem={mem_limit}, CPU={cpu_limit}")
-            
-        except Exception as e:
-            logging.error(f"Failed to apply default limits: {e}")
-            messagebox.showerror('Error', f'Failed to apply limits: {e}')
+    # Default resource limits feature removed; export still accepts optional values
 
     # --- Compose Tab Methods ---
     def toggle_auto_refresh(self):

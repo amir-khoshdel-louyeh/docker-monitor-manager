@@ -54,7 +54,7 @@ class SystemManager:
             'This will remove:\n'
             '- All stopped containers\n'
             '- All unused networks\n'
-            '- All dangling images\n'
+            "- All unused images (not just dangling)\n"
             '- All build cache\n\n'
             'Are you sure?'
         )
@@ -70,8 +70,14 @@ class SystemManager:
                     result = client.containers.prune()
                 status_bar.after(0, lambda: logging.info(f"✓ Removed {len(result.get('ContainersDeleted', []))} containers"))
                 
+                # Prune images: include all unused images (same as `docker image prune --all`)
                 with docker_lock:
-                    result = client.images.prune()
+                    try:
+                        result = client.images.prune(filters={'dangling': False})
+                    except TypeError:
+                        # Some docker-py versions accept positional dict; fallback
+                        result = client.images.prune({'dangling': False})
+
                 status_bar.after(0, lambda: logging.info(f"✓ Removed {len(result.get('ImagesDeleted', []))} images"))
                 
                 with docker_lock:

@@ -47,7 +47,10 @@ class ContainerManager:
                     if action == 'remove':
                         container.stop()
                         container.remove(force=True)
-                        docker_cleanup()
+                        # Do NOT perform automatic cleanup here; resource pruning
+                        # should only happen when the user triggers a prune action
+                        # via the UI. This avoids unexpected image/volume/network
+                        # pruning after container removal.
                     elif hasattr(container, action):
                         getattr(container, action)()
                     success = True
@@ -95,8 +98,8 @@ class ContainerManager:
                     if handler:
                         list(map(lambda c: handler(c) if handler else None, containers))
 
-                if action in ['stop', 'remove']:
-                    docker_cleanup()
+                # Do NOT perform automatic cleanup after global actions.
+                # Pruning must be initiated explicitly via the UI prune buttons.
 
                 stats_list = ContainerManager.fetch_all_stats()
                 controller.update_containers(stats_list)

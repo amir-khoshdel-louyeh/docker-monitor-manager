@@ -270,9 +270,10 @@ def scale_container(container, all_containers):
         except Exception as e:
             logging.error(f"Unexpected error pausing container '{container_name}': {e}")
         delete_clones(container, all_containers)
-        # Schedule cleanup via shared worker to avoid raw thread storms
-        from docker_monitor.utils.worker import run_in_thread
-        run_in_thread(docker_cleanup, on_done=None, on_error=lambda e: logging.error(f"Cleanup failed: {e}"), tk_root=None, block=False)
+    # Do NOT schedule automatic cleanup here. Resource pruning should only
+    # be performed when the user explicitly requests it via the UI prune
+    # buttons. This avoids unexpected image/volume/network pruning during
+    # scaling operations.
         return
 
     # If auto-scaling is disabled, do not create clones automatically.
@@ -437,10 +438,8 @@ def docker_events_listener():
                             _offer_latest(stats_queue, stats_list, "stats")
                             _offer_latest(manual_refresh_queue, stats_list, "manual refresh")
 
-                            # If the container was destroyed, schedule cleanup to free resources
-                            if event_action == 'destroy':
-                                from docker_monitor.utils.worker import run_in_thread
-                                run_in_thread(docker_cleanup, on_done=None, on_error=lambda e: logging.error(f"Cleanup failed: {e}"), tk_root=None, block=False)
+                            # If the container was destroyed, do NOT run automatic cleanup.
+                            # Cleanup/prune should be triggered explicitly by the user.
 
                         except docker.errors.NotFound as e:
                             # This can happen if a specific container referenced in the

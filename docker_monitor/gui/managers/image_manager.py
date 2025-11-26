@@ -5,6 +5,8 @@ Handles all image-related operations including listing, pulling, removing, and i
 
 import logging
 import tkinter as tk
+import json
+from tkinter import scrolledtext, messagebox
 from docker_monitor.utils.docker_utils import client, docker_lock
 from docker_monitor.utils.docker_controller import get_docker_controller
 
@@ -302,6 +304,63 @@ class ImageManager:
         
         from docker_monitor.utils.worker import run_in_thread
         run_in_thread(remove_all, on_done=None, on_error=lambda e: logging.error(f"Remove all failed: {e}"), tk_root=None, block=True)
+
+    @staticmethod
+    def show_image_inspect_modal(parent, image_id):
+        """Show a modal window with the full image inspection JSON."""
+        try:
+            win = tk.Toplevel(parent)
+            win.title(f"Inspect: {image_id}")
+            win.transient(parent)
+            win.grab_set()
+
+            frame = tk.Frame(win, padx=8, pady=8)
+            frame.pack(fill=tk.BOTH, expand=True)
+
+            txt = scrolledtext.ScrolledText(frame, height=30, wrap=tk.NONE, bg='#ffffff', fg='#000000')
+            txt.pack(fill=tk.BOTH, expand=True)
+            txt.insert(tk.END, "Loading image information...")
+            txt.config(state='disabled')
+
+            btn = tk.Button(frame, text='Close', command=win.destroy)
+            btn.pack(pady=8)
+
+            # Fetch attrs in background
+            from docker_monitor.utils.worker import run_in_thread
+
+            def _fetch():
+                with docker_lock:
+                    image = client.images.get(image_id)
+                    return image.attrs
+
+            def _on_done(info):
+                try:
+                    txt.config(state='normal')
+                    txt.delete('1.0', tk.END)
+                    try:
+                        txt.insert(tk.END, json.dumps(info, indent=2))
+                    except Exception:
+                        txt.insert(tk.END, str(info))
+                    txt.config(state='disabled')
+                except Exception as e:
+                    logging.error(f"Error rendering inspect modal: {e}")
+                    messagebox.showerror('Error', f'Failed to render image info: {e}')
+
+            def _on_error(e):
+                logging.error(f"Error fetching image info for inspect modal: {e}")
+                try:
+                    txt.config(state='normal')
+                    txt.delete('1.0', tk.END)
+                    txt.insert(tk.END, f"Error loading image information: {e}")
+                    txt.config(state='disabled')
+                except Exception:
+                    pass
+
+            run_in_thread(_fetch, on_done=_on_done, on_error=_on_error, tk_root=parent, block=False)
+
+        except Exception as e:
+            logging.error(f"Failed to open inspect modal: {e}")
+            messagebox.showerror('Error', f'Failed to open inspect window: {e}')
     
     @staticmethod
     def display_image_info(info_text, image_id, placeholder_label):
