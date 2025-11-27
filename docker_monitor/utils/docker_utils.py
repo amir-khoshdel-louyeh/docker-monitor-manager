@@ -3,6 +3,7 @@ import time
 import logging
 import queue
 import threading
+import uuid
 
 # Import the Docker Data Controller
 from docker_monitor.utils.docker_controller import get_docker_controller
@@ -16,6 +17,10 @@ SLEEP_TIME = 1    # Polling interval in seconds
 # By default disable automatic scaling to avoid unexpected container creation
 # unless explicitly enabled by the user in settings/UI.
 AUTO_SCALE_ENABLED = True
+# Configuration version: increment when any runtime config value changes.
+# Monitor loop checks this to avoid acting on stale decisions when the
+# configuration is updated concurrently from the GUI.
+CONFIG_VERSION = 0
 
 # Only react to events for containers that the app created (label) or that
 # match this name prefix. This prevents the GUI from chasing external
@@ -281,12 +286,60 @@ def scale_container(container, all_containers):
         logging.info(f"Auto-scaling is disabled; skipping clone creation for '{container_name}'")
         return
 
-    # IMPORTANT: automatic clone creation was used for testing and has been
-    # removed to ensure we never start containers without explicit user
-    # consent. If you need cloning in the future, implement an explicit
-    # user-driven action in the UI and call a well-audited helper instead.
-    logging.info(f"Auto-clone creation disabled by policy; skipping clone for '{container_name}'.")
-    return
+    # Automatic clone creation: create a labeled clone of the container.
+    # Safety notes:
+    #  - Do not exceed CLONE_NUM total clones for a given parent.
+    #  - Create at most one clone per scale event to avoid bursts.
+    #  - Label clones so they can be identified and deleted by `delete_clones`.
+    try:
+        clones_to_create = max(0, CLONE_NUM - len(existing_clones))
+        if clones_to_create <= 0:
+            logging.info(f"No clones needed for '{container_name}' (already at max).")
+            return
+
+        # Determine the image to use for the clone. Prefer a tagged image when
+        # available, fall back to image id.
+        image = None
+        try:
+            if getattr(container, 'image', None) and getattr(container.image, 'tags', None):
+                image = container.image.tags[0]
+            else:
+                image = container.image.id
+        except Exception:
+            image = getattr(container.image, 'id', None) if getattr(container, 'image', None) else None
+
+        # Try to reuse container command/config where reasonable
+        cmd = None
+        try:
+            cmd = container.attrs.get('Config', {}).get('Cmd') if hasattr(container, 'attrs') else None
+        except Exception:
+            cmd = None
+
+        labels = {
+            'dmm.is_clone': 'true',
+            'dmm.parent_container': container_name,
+            'dmm.created_by': APP_CREATED_BY_LABEL,
+        }
+
+        # Create only one clone per scale invocation for safety. If you want
+        # more aggressive scaling, adjust this logic and add rate limiting.
+        try:
+            clone_name = f"{container_name}-clone-{uuid.uuid4().hex[:8]}"
+            new_container = client.containers.run(
+                image=image,
+                command=cmd,
+                name=clone_name,
+                detach=True,
+                labels=labels,
+            )
+            logging.info(f"Created clone container '{getattr(new_container, 'name', 'unknown')}' for parent '{container_name}'.")
+        except docker.errors.APIError as e:
+            logging.error(f"Docker API error creating clone for '{container_name}': {e}")
+        except Exception as e:
+            logging.error(f"Failed to create clone for '{container_name}': {e}")
+
+    except Exception as e:
+        logging.error(f"Unexpected error during clone creation for '{container_name}': {e}")
 
 
 def monitor_thread():
@@ -311,6 +364,13 @@ def monitor_thread():
 
             # --- Auto-scaling logic ---
             if AUTO_SCALE_ENABLED:
+                # Capture the config version observed at the start of the
+                # decision window. If the GUI updates configuration while
+                # we are processing, we'll skip acting on stale decisions.
+                try:
+                    observed_config_version = CONFIG_VERSION
+                except NameError:
+                    observed_config_version = 0
                 running_overloaded = []
                 for container, stats in container_stats_pairs:
                     if not stats:
@@ -327,12 +387,31 @@ def monitor_thread():
 
                 for container, stats in running_overloaded:
                     try:
+                        # Re-check AUTO_SCALE_ENABLED in case the user toggled
+                        # it off after we collected the overloaded list.
+                        if not AUTO_SCALE_ENABLED:
+                            logging.info(f"Auto-scaling disabled during handling; skipping scaling for '{container.name}'")
+                            continue
+
                         logging.info(
                             "Container %s overloaded (CPU: %s%%, RAM: %s%%). Scaling...",
                             container.name,
                             stats.get('cpu', 'n/a'),
                             stats.get('ram', 'n/a')
                         )
+
+                        # If configuration changed while we were preparing to
+                        # act, skip this scaling action to avoid following a
+                        # stale decision.
+                        try:
+                            current_version = CONFIG_VERSION
+                        except NameError:
+                            current_version = 0
+
+                        if current_version != observed_config_version:
+                            logging.info(f"Configuration changed during handling; skipping scaling for '{container.name}'")
+                            continue
+
                         scale_container(container, all_containers)
                     except (ValueError, KeyError, AttributeError) as e:
                         logging.debug(f"Error processing stats for {container.name}: {e}")

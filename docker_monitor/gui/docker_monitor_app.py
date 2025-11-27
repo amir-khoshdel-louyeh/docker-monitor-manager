@@ -3063,6 +3063,26 @@ class DockerMonitorApp(tk.Tk, Observer):
                 SLEEP_TIME = new_sleep
                 AUTO_SCALE_ENABLED = bool(auto_var.get())
 
+                # Also update the runtime values in the docker_utils module so
+                # background threads use the latest settings. We import via
+                # importlib to avoid circular import issues at module top-level.
+                try:
+                    import importlib
+                    docker_utils = importlib.import_module('docker_monitor.utils.docker_utils')
+                    docker_utils.CPU_LIMIT = new_cpu
+                    docker_utils.RAM_LIMIT = new_ram
+                    docker_utils.CLONE_NUM = new_clones
+                    docker_utils.SLEEP_TIME = new_sleep
+                    docker_utils.AUTO_SCALE_ENABLED = bool(auto_var.get())
+                    # Bump the configuration version so background threads
+                    # detect the change and avoid acting on stale decisions.
+                    try:
+                        docker_utils.CONFIG_VERSION = getattr(docker_utils, 'CONFIG_VERSION', 0) + 1
+                    except Exception:
+                        pass
+                except Exception as _e:
+                    logging.debug(f"Could not update backend docker_utils config: {_e}")
+
                 logging.info(f"Configuration updated: CPU={new_cpu}%, RAM={new_ram}%, Clones={new_clones}, Interval={new_sleep}s, Auto-scale={AUTO_SCALE_ENABLED}")
                 config_window.destroy()
             except ValueError:
