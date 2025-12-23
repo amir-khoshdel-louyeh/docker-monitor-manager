@@ -192,3 +192,5 @@ Thumbs.db
 
 # Ensure local editable installs / virtualenv contents are ignored explicitly
 /.venv/
+
+/HELP_PUBLISH-dmm.txt
